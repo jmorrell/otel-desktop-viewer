@@ -178,7 +178,6 @@ impl Viewer {
 
 impl Viewer {
     pub fn render_appearance(&mut self, cx: &mut Context<Self>) -> AnyElement {
-        use gpui_kit::component::button::Button;
         let p = crate::theme::palette(self.prefs.dark);
         let names = crate::theme::ink_names();
         let selected = if self.prefs.ink == usize::MAX {
@@ -188,12 +187,14 @@ impl Viewer {
         };
         let mut seasons = div().flex().gap_1();
         for (index, name) in ["Haru", "Natsu", "Aki", "Fuyu"].iter().enumerate() {
-            seasons = seasons.child(Button::new(("season", index)).label(*name).on_click(
-                cx.listener(move |this, _, _, cx| {
-                    this.prefs.season = index;
-                    this.update_appearance(cx);
-                }),
-            ))
+            seasons = seasons.child(
+                crate::widgets::button(("season", index))
+                    .label(*name)
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.prefs.season = index;
+                        this.update_appearance(cx);
+                    })),
+            )
         }
         let count = names.len();
         let mut inks = div()
@@ -333,7 +334,14 @@ impl Viewer {
 
 impl Viewer {
     pub fn pane_widths(&self, window: &Window) -> (f32, f32) {
-        let available = f32::from(window.viewport_size().width);
+        let available = (f32::from(window.viewport_size().width) - 32.).max(0.);
+        if self.workspace_stacked(window) {
+            let list = self
+                .prefs
+                .list_width
+                .clamp(240., (available - 336.).max(240.));
+            return (list, (available - list - 16.).max(240.));
+        }
         let main = (available * 0.3).max(448.).min(available * 0.65);
         let list = if self.prefs.list_open && self.page != crate::app::Page::Logs {
             self.prefs.list_width.max(160.)
@@ -345,7 +353,8 @@ impl Viewer {
         } else {
             0.
         };
-        let budget = (available - main - 16.).max(0.);
+        let gaps = if list > 0. { 16. } else { 0. } + if details > 0. { 16. } else { 0. };
+        let budget = (available - main - gaps).max(0.);
         let total = list + details;
         if total > budget && total > 0. {
             (list * budget / total, details * budget / total)
@@ -362,9 +371,9 @@ impl Viewer {
                     .id("resize-list")
                     .test_support()
                     .absolute()
-                    .top(px(self.toolbar_height))
-                    .bottom(px(36.))
-                    .left(px(list - 3.))
+                    .top(px(self.toolbar_height + 24.))
+                    .bottom(px(self.status_height() + 8.))
+                    .left(px(16. + list + 5.))
                     .w(px(6.))
                     .cursor(CursorStyle::ResizeLeftRight)
                     .on_mouse_down(
@@ -378,15 +387,41 @@ impl Viewer {
                     .into_any_element(),
             );
         }
-        if details > 0. {
+        if details > 0. && self.workspace_stacked(window) {
             handles.push(
                 div()
                     .id("resize-details")
                     .test_support()
                     .absolute()
-                    .top(px(self.toolbar_height))
-                    .bottom(px(36.))
-                    .right(px(details - 3.))
+                    .left(px(16. + list + 16.))
+                    .right(px(16.))
+                    .top(px(self.toolbar_height
+                        + 24.
+                        + self.stacked_main_height(window)
+                        + 5.))
+                    .h(px(6.))
+                    .cursor(CursorStyle::ResizeUpDown)
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|this, event: &MouseDownEvent, window, cx| {
+                            this.resizing_stack = Some((
+                                f32::from(event.position.y),
+                                this.stacked_main_height(window),
+                            ));
+                            cx.stop_propagation();
+                        }),
+                    )
+                    .into_any_element(),
+            );
+        } else if details > 0. {
+            handles.push(
+                div()
+                    .id("resize-details")
+                    .test_support()
+                    .absolute()
+                    .top(px(self.toolbar_height + 24.))
+                    .bottom(px(self.status_height() + 8.))
+                    .right(px(16. + details + 5.))
                     .w(px(6.))
                     .cursor(CursorStyle::ResizeLeftRight)
                     .on_mouse_down(
@@ -409,7 +444,7 @@ impl Viewer {
 
 impl Viewer {
     pub fn render_time_picker(&mut self, cx: &mut Context<Self>) -> AnyElement {
-        use gpui_kit::component::{button::Button, input::Input};
+        use gpui_kit::component::input::Input;
         let p = crate::theme::palette(self.prefs.dark);
         let mut presets = div().flex().flex_wrap().gap_1();
         for (minutes, label) in [
@@ -423,7 +458,7 @@ impl Viewer {
             (Some(43200), "30d"),
         ] {
             presets = presets.child(
-                Button::new(SharedString::from(format!("time-{label}")))
+                crate::widgets::button(SharedString::from(format!("time-{label}")))
                     .label(label)
                     .on_click(
                         cx.listener(move |this, _, _, cx| this.set_relative_time(minutes, cx)),
@@ -456,21 +491,21 @@ impl Viewer {
                     .flex()
                     .gap_1()
                     .child(
-                        Button::new("timezone-local")
+                        crate::widgets::button("timezone-local")
                             .label("Local")
                             .on_click(cx.listener(|this, _, window, cx| {
                                 this.change_timezone("Local".into(), window, cx)
                             })),
                     )
                     .child(
-                        Button::new("timezone-utc")
+                        crate::widgets::button("timezone-utc")
                             .label("UTC")
                             .on_click(cx.listener(|this, _, window, cx| {
                                 this.change_timezone("UTC".into(), window, cx)
                             })),
                     )
                     .child(
-                        Button::new("timezone-apply")
+                        crate::widgets::button("timezone-apply")
                             .label("Apply timezone")
                             .on_click(cx.listener(|this, _, window, cx| {
                                 this.change_timezone(
@@ -497,7 +532,7 @@ impl Viewer {
                     .aria_label("End time"),
             )
             .child(
-                Button::new("apply-absolute-time")
+                crate::widgets::button("apply-absolute-time")
                     .label("Apply absolute range")
                     .on_click(cx.listener(|this, _, _, cx| {
                         let start = parse_time_bound(
@@ -606,7 +641,6 @@ impl Viewer {
 
 impl Viewer {
     fn timezone_suggestions(&self, cx: &Context<Self>) -> Vec<AnyElement> {
-        use gpui_kit::component::button::Button;
         let term = self.timezone_input.read(cx).value().to_lowercase();
         if term.len() < 2 || term == "local" || term == "utc" {
             return Vec::new();
@@ -618,7 +652,7 @@ impl Viewer {
             .enumerate()
             .map(|(index, tz)| {
                 let name = tz.name().to_string();
-                Button::new(("timezone-suggestion", index))
+                crate::widgets::button(("timezone-suggestion", index))
                     .label(name.clone())
                     .on_click(cx.listener(move |this, _, window, cx| {
                         this.change_timezone(name.clone(), window, cx)
@@ -631,7 +665,6 @@ impl Viewer {
 
 impl Viewer {
     pub fn render_import_report(&mut self, window: &Window, cx: &mut Context<Self>) -> AnyElement {
-        use gpui_kit::component::button::Button;
         let p = crate::theme::palette(self.prefs.dark);
         let reports = self
             .data
@@ -669,17 +702,23 @@ impl Viewer {
                         div()
                             .flex()
                             .gap_1()
-                            .child(Button::new("copy-import-results").label("Copy").on_click(
-                                move |_, _, cx| {
-                                    cx.write_to_clipboard(ClipboardItem::new_string(copy.clone()))
-                                },
-                            ))
-                            .child(Button::new("close-import-results").label("Close").on_click(
-                                cx.listener(|this, _, _, cx| {
-                                    this.import_report_open = false;
-                                    cx.notify();
-                                }),
-                            )),
+                            .child(
+                                crate::widgets::button("copy-import-results")
+                                    .label("Copy")
+                                    .on_click(move |_, _, cx| {
+                                        cx.write_to_clipboard(ClipboardItem::new_string(
+                                            copy.clone(),
+                                        ))
+                                    }),
+                            )
+                            .child(
+                                crate::widgets::button("close-import-results")
+                                    .label("Close")
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.import_report_open = false;
+                                        cx.notify();
+                                    })),
+                            ),
                     ),
             );
         if let Some(reports) = reports.as_array() {

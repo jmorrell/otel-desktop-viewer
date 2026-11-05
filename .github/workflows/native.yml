@@ -38,7 +38,7 @@ jobs:
       - name: Check Rust formatting and compile all test targets
         run: |
           cargo fmt --manifest-path native/Cargo.toml -- --check
-          cargo check --locked --manifest-path native/Cargo.toml --tests
+          cargo check --locked --manifest-path native/Cargo.toml --tests --test native_ui
       - name: Run native backend integration tests
         run: cargo test --locked --manifest-path native/Cargo.toml --test backend_integration
       - name: Run native unit tests

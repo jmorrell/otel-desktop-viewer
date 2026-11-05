@@ -4,7 +4,10 @@ use crate::{
     theme::{color, palette, service_color},
     widgets,
 };
-use gpui_kit::{component::button::Button, component::input::Input, *};
+use gpui_kit::{
+    component::{Selectable, input::Input},
+    *,
+};
 use serde_json::{Value, json};
 use std::{
     cell::Cell,
@@ -20,6 +23,10 @@ fn state_text(data: &HashMap<String, Value>, key: &str, fallback: &str) -> Strin
         .and_then(Value::as_str)
         .unwrap_or(fallback)
         .to_owned()
+}
+
+fn state_bool(data: &HashMap<String, Value>, key: &str, fallback: bool) -> bool {
+    data.get(key).and_then(Value::as_bool).unwrap_or(fallback)
 }
 
 fn page_size(data: &HashMap<String, Value>, signal: &str) -> usize {
@@ -127,7 +134,7 @@ fn service_label(service: &Value) -> String {
         name
     };
     if namespace.is_empty() {
-        format!("{name} · no namespace")
+        name
     } else if namespace_kind != "string" && !namespace_kind.is_empty() {
         format!("{namespace} / {name} · {namespace_kind}")
     } else {
@@ -149,6 +156,11 @@ fn display_count(service: &Value, signal: &str) -> String {
         "traces" => ("traces", service["traceCount"].as_u64().unwrap_or(0)),
         "logs" => ("logs", service["logCount"].as_u64().unwrap_or(0)),
         _ => ("metrics", service["metricCount"].as_u64().unwrap_or(0)),
+    };
+    let label = if value == 1 {
+        label.trim_end_matches('s')
+    } else {
+        label
     };
     format!("{value} {label}")
 }
@@ -310,6 +322,19 @@ fn project_map_point(point: (f32, f32), scale: f32, pan: (f32, f32)) -> (f32, f3
     )
 }
 
+fn service_map_positions(services: &[Value], scale: f32, pan: (f32, f32)) -> Vec<(f32, f32)> {
+    let rows = services.len().div_ceil(2).max(1);
+    services
+        .iter()
+        .enumerate()
+        .map(|(index, _)| {
+            let x = if index % 2 == 0 { 0.25 } else { 0.75 };
+            let y = (index / 2) as f32 + 0.5;
+            project_map_point((x, y / rows as f32), scale, pan)
+        })
+        .collect()
+}
+
 fn point_segment_distance(point: (f32, f32), start: (f32, f32), end: (f32, f32)) -> f32 {
     let dx = end.0 - start.0;
     let dy = end.1 - start.1;
@@ -334,6 +359,132 @@ fn hit_test_connection(
         .filter(|(distance, _)| *distance <= tolerance)
         .min_by(|a, b| a.0.total_cmp(&b.0))
         .map(|(_, edge)| edge.clone())
+}
+
+#[derive(Clone)]
+pub(crate) struct ServiceMapRoute {
+    pub(crate) reference: Value,
+    pub(crate) points: [(f32, f32); 4],
+    pub(crate) weight: u64,
+}
+
+pub(crate) fn service_map_connections(data: &HashMap<String, Value>) -> Vec<Value> {
+    let mut rows = Vec::new();
+    for (key, result) in data {
+        if key.starts_with("home.connections.") {
+            rows.extend(discovery_rows(result));
+        }
+    }
+    rows.sort_by(|a, b| {
+        let a_key = (
+            service_identity(&a["source"]),
+            service_identity(&a["target"]),
+        );
+        let b_key = (
+            service_identity(&b["source"]),
+            service_identity(&b["target"]),
+        );
+        a_key.cmp(&b_key)
+    });
+    rows.dedup_by(|a, b| {
+        service_identity(&a["source"]) == service_identity(&b["source"])
+            && service_identity(&a["target"]) == service_identity(&b["target"])
+    });
+    rows
+}
+
+fn service_edge_route(
+    source: (f32, f32),
+    target: (f32, f32),
+    source_left: bool,
+    target_left: bool,
+    lane: usize,
+    gutter_center: f32,
+    width: f32,
+    height: f32,
+) -> [(f32, f32); 4] {
+    let source_x = source.0 * width
+        + if source_left {
+            width * 0.21
+        } else {
+            -width * 0.21
+        };
+    let target_x = target.0 * width
+        + if target_left {
+            width * 0.21
+        } else {
+            -width * 0.21
+        };
+    let lane_sign = if lane % 2 == 0 { -1. } else { 1. };
+    let lane_distance = ((lane / 2 + 1) as f32 * 4.).min(width * 0.035);
+    let lane_x = gutter_center + lane_sign * lane_distance;
+    let source_y = source.1 * height;
+    let target_y = target.1 * height;
+    [
+        (source_x, source_y),
+        (lane_x, source_y),
+        (lane_x, target_y),
+        (target_x, target_y),
+    ]
+}
+
+pub(crate) fn service_map_routes(
+    services: &[Value],
+    connections: &[Value],
+    scale: f32,
+    pan: (f32, f32),
+    width: f32,
+    height: f32,
+) -> Vec<ServiceMapRoute> {
+    let gutter_center = project_map_point((0.5, 0.5), scale, pan).0 * width;
+    let positions = service_map_positions(services, scale, pan);
+    connections
+        .iter()
+        .enumerate()
+        .filter_map(|(lane, edge)| {
+            let source_id = service_identity(&edge["source"]);
+            let target_id = service_identity(&edge["target"]);
+            let source = services
+                .iter()
+                .position(|service| service_identity(service) == source_id)?;
+            let target = services
+                .iter()
+                .position(|service| service_identity(service) == target_id)?;
+            Some(ServiceMapRoute {
+                reference: edge.clone(),
+                points: service_edge_route(
+                    positions[source],
+                    positions[target],
+                    source % 2 == 0,
+                    target % 2 == 0,
+                    lane,
+                    gutter_center,
+                    width,
+                    height,
+                ),
+                weight: edge["spanCount"].as_u64().unwrap_or(1),
+            })
+        })
+        .collect()
+}
+
+fn hit_test_service_map_edges(
+    edges: &[ServiceMapRoute],
+    point: (f32, f32),
+    tolerance: f32,
+) -> Option<Value> {
+    edges
+        .iter()
+        .filter_map(|edge| {
+            let distance = edge
+                .points
+                .windows(2)
+                .map(|segment| point_segment_distance(point, segment[0], segment[1]))
+                .fold(f32::INFINITY, f32::min);
+            (distance <= tolerance).then_some((distance, edge.reference.clone()))
+        })
+        .min_by(|a, b| a.0.total_cmp(&b.0))
+        .map(|(_, edge)| edge)
 }
 
 fn human_bytes(value: &Value) -> String {
@@ -475,6 +626,27 @@ impl Viewer {
     /// each typed identity independently and merge results while rendering.
     pub fn refresh_home_connections(&mut self, cx: &mut Context<Self>) {
         let services = home_service_rows(&self.data);
+        if let Some(selected) = selected_identity(&self.data) {
+            if !services
+                .iter()
+                .any(|service| service_identity(service) == selected)
+            {
+                self.selected_service = None;
+                self.data.remove("home.selected-identity");
+                self.data.remove("home.selected-edge");
+            }
+        }
+        if self.selected_service.is_none() {
+            if let Some(service) = services.first() {
+                let name = field(service, "serviceName");
+                let namespace = field(service, "serviceNamespace");
+                let identity = service_identity(service);
+                self.selected_service = Some((name.clone(), namespace.clone()));
+                self.data
+                    .insert("home.selected-identity".into(), json!(identity.clone()));
+                self.refresh_selected_service(name, namespace, identity, cx);
+            }
+        }
         let input = self.search.read(cx).value().to_string();
         let (queries, _) = home_queries(&input);
         let term = self.home_filter.read(cx).value().to_string();
@@ -633,6 +805,10 @@ impl Viewer {
         cx: &mut Context<Self>,
     ) {
         let changed = selected_identity(&self.data).as_deref() != Some(identity.as_str());
+        self.data.remove("home.selected-edge");
+        self.data.remove("home.connection-spans");
+        self.data
+            .insert("home.details-tab".into(), json!("telemetry"));
         self.selected_service = Some((name.clone(), namespace.clone()));
         self.data
             .insert("home.selected-identity".into(), json!(identity));
@@ -987,8 +1163,6 @@ impl Viewer {
     }
 
     pub fn render_home(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
-        let p = palette(self.prefs.dark);
-        let (list_width, details_width) = self.pane_widths(window);
         let mut services = home_service_rows(&self.data);
         let issue_signal = state_text(&self.data, "home.issue-signal", "");
         if !issue_signal.is_empty() {
@@ -1002,116 +1176,364 @@ impl Viewer {
         let selected_service_sort = state_text(&self.data, "home.service-sort", "name");
         let service_direction = state_text(&self.data, "home.service-direction", "asc");
         service_sort(&mut services, &selected_service_sort, &service_direction);
-        let more_services = home_services_have_more(&self.data);
         let connections = self.connection_rows();
         let stats = self.data.get("getStats").cloned().unwrap_or(Value::Null);
-        let filter_text = self.home_filter.read(cx).value().to_string();
-        let mut shell = div().flex().size_full().gap_2();
+        let list = self
+            .prefs
+            .list_open
+            .then(|| self.render_home_welcome(&stats, cx));
+        let main = self.render_service_map(&services, &connections, cx);
+        let details = self
+            .prefs
+            .details_open
+            .then(|| self.render_home_details(cx));
+        self.render_workspace(list, main, details, window)
+    }
 
-        if self.prefs.list_open {
-            let mut sidebar =
+    fn render_home_welcome(&mut self, stats: &Value, cx: &mut Context<Self>) -> AnyElement {
+        let p = palette(self.prefs.dark);
+        let protocol = state_text(&self.data, "home.setup-protocol", "http");
+        let backend = self.backend.as_ref();
+        let endpoint = if protocol == "grpc" {
+            backend.map(|backend| format!("http://127.0.0.1:{}", backend.config.grpc_port))
+        } else {
+            backend.map(|backend| format!("http://127.0.0.1:{}", backend.config.http_port))
+        };
+        let protocol_name = if protocol == "grpc" {
+            "grpc"
+        } else {
+            "http/protobuf"
+        };
+        let endpoint_value = endpoint
+            .clone()
+            .unwrap_or_else(|| "Collector starting…".to_owned());
+        let env = format!(
+            "export OTEL_EXPORTER_OTLP_ENDPOINT=\\\n\"{}\"\nexport OTEL_EXPORTER_OTLP_PROTOCOL=\\\n\"{}\"\nexport OTEL_SERVICE_NAME=\"my-service\"",
+            endpoint_value, protocol_name
+        );
+        let test_command = format!(
+            "otel-cli exec \\\n  --endpoint {} \\\n  --protocol {} \\\n  --service my-service \\\n  --name \"test trace\" \\\n  -- sleep 1",
+            endpoint.as_deref().unwrap_or("http://127.0.0.1:4318"),
+            protocol_name
+        );
+        let escaped_env = env
+            .replace('&', "&amp;")
+            .replace('<', "&lt;")
+            .replace('>', "&gt;")
+            .replace('\n', "<br>");
+        let escaped_command = test_command
+            .replace('&', "&amp;")
+            .replace('<', "&lt;")
+            .replace('>', "&gt;")
+            .replace('\n', "<br>");
+        let env_panel = div()
+            .id("home-otlp-panel")
+            .rounded_md()
+            .border_1()
+            .border_color(color(p.chrome))
+            .overflow_hidden()
+            .child(
                 div()
-                    .id("home-services")
-                    .w(px(list_width))
-                    .min_w(px(140.))
-                    .h_full()
+                    .h(px(48.))
                     .flex()
-                    .flex_col()
+                    .items_center()
+                    .gap_1()
+                    .px_2()
                     .bg(color(p.panel))
-                    .rounded_lg()
+                    .child(
+                        widgets::button("home-otlp-http")
+                            .label("HTTP")
+                            .selected(protocol == "http")
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.data
+                                    .insert("home.setup-protocol".into(), json!("http"));
+                                cx.notify();
+                            })),
+                    )
+                    .child(
+                        widgets::button("home-otlp-grpc")
+                            .label("gRPC")
+                            .selected(protocol == "grpc")
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.data
+                                    .insert("home.setup-protocol".into(), json!("grpc"));
+                                cx.notify();
+                            })),
+                    )
+                    .child(div().flex_1())
+                    .child(
+                        widgets::button("home-copy-otlp-env")
+                            .label("Copy")
+                            .on_click(move |_, _, cx| {
+                                cx.write_to_clipboard(ClipboardItem::new_string(env.clone()))
+                            }),
+                    ),
+            )
+            .child(
+                div()
+                    .id("home-otlp-env")
+                    .test_support()
+                    .p_3()
+                    .bg(color(p.canvas))
+                    .child(
+                        gpui_kit::component::text::TextView::html(
+                            "home-otlp-env-text",
+                            format!("<pre>{escaped_env}</pre>"),
+                        )
+                        .selectable(true),
+                    ),
+            );
+        let cli_panel = div()
+            .id("home-otel-cli-panel")
+            .rounded_md()
+            .border_1()
+            .border_color(color(p.chrome))
+            .overflow_hidden()
+            .child(
+                div()
+                    .h(px(48.))
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .px_2()
+                    .bg(color(p.panel))
+                    .child("Shell")
+                    .child(
+                        widgets::button("home-copy-otel-cli")
+                            .label("Copy")
+                            .on_click(move |_, _, cx| {
+                                cx.write_to_clipboard(ClipboardItem::new_string(
+                                    test_command.clone(),
+                                ))
+                            }),
+                    ),
+            )
+            .child(
+                div().p_3().bg(color(p.canvas)).child(
+                    gpui_kit::component::text::TextView::html(
+                        "home-otel-cli-text",
+                        format!("<pre>{escaped_command}</pre>"),
+                    )
+                    .selectable(true),
+                ),
+            );
+        let mut setup = div()
+            .id("home-onboarding-content")
+            .flex()
+            .flex_col()
+            .gap_3()
+            .p_4()
+            .child(widgets::heading("Connect an exporter", p))
+            .child(div().text_sm().text_color(color(p.subtle)).child(
+                "Set these variables in the terminal where you start your instrumented app.",
+            ))
+            .child(env_panel)
+            .child(widgets::heading("Send a test trace", p))
+            .child(
+                div()
+                    .text_sm()
+                    .text_color(color(p.subtle))
+                    .child("Run this with otel-cli installed."),
+            )
+            .child(cli_panel);
+        if endpoint.is_none() {
+            setup = setup.child(widgets::empty(
+                "Receiver addresses will appear when the Collector is ready.",
+                p,
+            ));
+        }
+        let sidebar = div()
+            .id("home-onboarding")
+            .test_support()
+            .role(Role::Group)
+            .aria_label("OTel Desktop Viewer onboarding")
+            .h_full()
+            .min_w_0()
+            .flex()
+            .flex_col()
+            .overflow_hidden()
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .px_1()
+                    .py_2()
+                    .child(self.lulu_mascot())
                     .child(
                         div()
-                            .p_3()
                             .flex()
                             .flex_col()
-                            .gap_2()
+                            .text_lg()
+                            .child("OTel Desktop Viewer")
                             .child(
-                                Button::new("home-import")
-                                    .label("Import OTLP JSON…")
+                                div()
+                                    .text_xs()
+                                    .text_color(color(p.subtle))
+                                    .child("Now with “a lot more functionality”™"),
+                            ),
+                    ),
+            )
+            .child(
+                div()
+                    .id("home-onboarding-scroll")
+                    .flex_1()
+                    .min_h_0()
+                    .overflow_y_scroll()
+                    .child(
+                        div()
+                            .id("home-import-dropzone")
+                            .test_support()
+                            .role(Role::Button)
+                            .aria_label("Import telemetry JSON files")
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .min_h(px(96.))
+                            .m_4()
+                            .rounded_lg()
+                            .border_1()
+                            .border_color(color(p.chrome))
+                            .cursor_pointer()
+                            .child(
+                                widgets::button("home-import")
+                                    .label("Drop telemetry JSON files here or Import…")
                                     .on_click(cx.listener(|this, _, window, cx| {
                                         this.import_files(window, cx)
                                     })),
-                            )
-                            .child(Input::new(&self.home_filter))
-                            .child(widgets::heading(
-                                format!(
-                                    "Services · {}{}",
-                                    services.len(),
-                                    if more_services { "+" } else { "" }
-                                ),
-                                p,
-                            ))
-                            .children((!issue_signal.is_empty()).then(|| {
-                                Button::new("clear-issue-filter")
-                                    .label(format!("Showing {issue_signal} services · Clear"))
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.data.remove("home.issue-signal");
-                                        cx.notify();
-                                    }))
-                            }))
-                            .child(
-                                Button::new("home-service-sort")
-                                    .label(format!(
-                                        "Sort: {} {}",
-                                        selected_service_sort, service_direction
-                                    ))
-                                    .on_click(
-                                        cx.listener(|this, _, _, cx| this.cycle_service_sort(cx)),
-                                    ),
                             ),
-                    );
-            let mut list = div().id("service-list").overflow_y_scroll().flex_1();
-            for (index, service) in services.iter().enumerate() {
-                list = list.child(self.service_row(service, index, cx));
-            }
-            if more_services {
-                list = list.child(
-                    Button::new("home-more-services-list")
-                        .label("More services")
-                        .on_click(cx.listener(|this, _, _, cx| this.load_more_home_services(cx))),
-                );
-            }
-            if services.is_empty() {
-                list = list.child(widgets::empty(
-                    if filter_text.is_empty() {
-                        "Waiting for telemetry"
-                    } else {
-                        "No services match this filter and time range"
-                    },
-                    p,
-                ));
-            }
-            sidebar = sidebar
-                .child(list)
-                .child(self.storage_and_issues(&stats, cx));
-            shell = shell.child(sidebar);
-        }
+                    )
+                    .child(setup),
+            )
+            .child(self.storage_and_issues(stats, cx));
+        // The shared workspace assigns the actual pane width and dividers.
+        // Keep this panel's contents fluid so the right edge remains draggable.
+        sidebar.into_any_element()
+    }
 
-        let mut main = div()
-            .id("home-main")
-            .flex_1()
-            .min_w_0()
+    fn lulu_mascot(&self) -> AnyElement {
+        let sprite = include_str!(
+            "../../desktopexporter/internal/frontend/src/assets/images/lulu-pixel.txt"
+        );
+        let rows: Vec<Vec<char>> = sprite.lines().map(|row| row.chars().collect()).collect();
+        let width = rows.iter().map(Vec::len).max().unwrap_or(1).max(1) as f32;
+        let height = rows.len().max(1) as f32;
+        div()
+            .id("home-lulu-mascot")
+            .test_support()
+            .role(Role::Image)
+            .aria_label("Lulu the axolotl")
+            .w(px(52.))
+            .h(px(44.))
+            .child(
+                canvas(
+                    |_, _, _| (),
+                    move |bounds, _, window, _| {
+                        let cell_w = bounds.size.width / width;
+                        let cell_h = bounds.size.height / height;
+                        for (y, row) in rows.iter().enumerate() {
+                            for (x, pixel) in row.iter().enumerate() {
+                                let ink = match pixel {
+                                    'o' | 'e' => color(0x9b334e),
+                                    's' => color(0xe8adae),
+                                    'b' => color(0xe6c0bd),
+                                    'g' => color(0xed7d93),
+                                    'G' => color(0xdb6b7c),
+                                    'w' => color(0xffe5ed),
+                                    _ => continue,
+                                };
+                                window.paint_quad(fill(
+                                    Bounds {
+                                        origin: bounds.origin
+                                            + point(cell_w * x as f32, cell_h * y as f32),
+                                        size: size(cell_w, cell_h),
+                                    },
+                                    ink,
+                                ));
+                            }
+                        }
+                    },
+                )
+                .size_full(),
+            )
+            .into_any_element()
+    }
+
+    fn render_home_details(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        if !self
+            .data
+            .get("home.selected-edge")
+            .unwrap_or(&Value::Null)
+            .is_null()
+        {
+            return self.render_connection_details(cx);
+        }
+        let p = palette(self.prefs.dark);
+        let Some((name, namespace)) = self.selected_service.clone() else {
+            return div()
+                .id("home-details-empty")
+                .h_full()
+                .child(widgets::empty(
+                    "Select a service or connection to inspect telemetry.",
+                    p,
+                ))
+                .into_any_element();
+        };
+        let active = state_text(&self.data, "home.details-tab", "telemetry");
+        let service = home_service_rows(&self.data)
+            .into_iter()
+            .find(|service| {
+                service_identity(service) == selected_identity(&self.data).unwrap_or_default()
+            })
+            .unwrap_or_else(|| json!({"serviceName":name,"serviceNamespace":namespace}));
+        let mut header = div()
+            .id("home-details-header")
+            .flex()
+            .items_center()
+            .justify_between()
+            .gap_1()
+            .h(px(48.))
+            .px_2()
+            .mb_2()
+            .rounded_lg()
+            .bg(color(p.panel))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .text_sm()
+                    .text_ellipsis()
+                    .child(service_label(&service)),
+            );
+        for (tab, label) in [("telemetry", "Telemetry"), ("attributes", "Attributes")] {
+            let selected = active == tab;
+            header = header.child(
+                widgets::button(format!("home-details-{tab}"))
+                    .label(label)
+                    .selected(selected)
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.data.insert("home.details-tab".into(), json!(tab));
+                        cx.notify();
+                    })),
+            );
+        }
+        let content = if active == "attributes" {
+            self.render_service_attributes(&name, &namespace, cx)
+        } else {
+            self.render_service_telemetry(cx)
+        };
+        div()
+            .id("home-details-panel")
+            .test_support()
+            .role(Role::Group)
+            .aria_label("Selected service details")
             .h_full()
+            .min_w_0()
             .flex()
             .flex_col()
-            .bg(color(p.canvas))
-            .rounded_lg();
-        if let Some((name, namespace)) = self.selected_service.clone() {
-            main = main.child(self.render_service_attributes(&name, &namespace, cx));
-        } else {
-            main = main.child(self.render_service_map(&services, &connections, cx));
-        }
-        shell = shell.child(main);
-
-        if self.prefs.details_open {
-            let details = if self.selected_service.is_some() {
-                self.render_service_telemetry(details_width, cx)
-            } else {
-                self.render_connection_details(details_width, cx)
-            };
-            shell = shell.child(details);
-        }
-        shell.into_any_element()
+            .child(header)
+            .child(content)
+            .into_any_element()
     }
 
     fn has_more_connections(&self) -> bool {
@@ -1213,76 +1635,7 @@ impl Viewer {
     }
 
     fn connection_rows(&self) -> Vec<Value> {
-        let mut rows = Vec::new();
-        for (key, result) in &self.data {
-            if key.starts_with("home.connections.") {
-                rows.extend(discovery_rows(result));
-            }
-        }
-        rows.sort_by(|a, b| {
-            let a_key = (
-                service_identity(&a["source"]),
-                service_identity(&a["target"]),
-            );
-            let b_key = (
-                service_identity(&b["source"]),
-                service_identity(&b["target"]),
-            );
-            a_key.cmp(&b_key)
-        });
-        rows.dedup_by(|a, b| {
-            service_identity(&a["source"]) == service_identity(&b["source"])
-                && service_identity(&a["target"]) == service_identity(&b["target"])
-        });
-        rows
-    }
-
-    fn service_row(&self, service: &Value, index: usize, cx: &mut Context<Self>) -> AnyElement {
-        let p = palette(self.prefs.dark);
-        let name = field(service, "serviceName");
-        let namespace = field(service, "serviceNamespace");
-        let identity = service_identity(service);
-        let selected = selected_identity(&self.data).as_deref() == Some(identity.as_str());
-        let title = service_label(service);
-        let color_value = service_color(&identity, self.prefs.dark);
-        div()
-            .id(("home-service", index))
-            .test_support()
-            .role(Role::Button)
-            .aria_label(title.clone())
-            .aria_selected(selected)
-            .m_2()
-            .p_3()
-            .rounded_md()
-            .bg(color(if selected { p.selection } else { p.canvas }))
-            .border_l_2()
-            .border_color(color(color_value))
-            .cursor_pointer()
-            .on_click(cx.listener(move |this, _, _, cx| {
-                this.select_service(name.clone(), namespace.clone(), identity.clone(), cx)
-            }))
-            .child(div().text_ellipsis().child(title))
-            .child(
-                div()
-                    .flex()
-                    .gap_2()
-                    .text_xs()
-                    .text_color(color(p.subtle))
-                    .child(format!("{} spans", field(service, "spanCount")))
-                    .child(format!("{} logs", field(service, "logCount")))
-                    .child(format!("{} points", field(service, "dataPointCount"))),
-            )
-            .child(
-                div()
-                    .flex()
-                    .gap_2()
-                    .text_xs()
-                    .text_color(color(p.subtle))
-                    .child(format!("{} errors", field(service, "errorSpanCount")))
-                    .child(format!("{} metrics", field(service, "metricCount")))
-                    .child(format!("{} exemplars", field(service, "exemplarCount"))),
-            )
-            .into_any_element()
+        service_map_connections(&self.data)
     }
 
     fn storage_and_issues(&mut self, stats: &Value, cx: &mut Context<Self>) -> AnyElement {
@@ -1295,16 +1648,30 @@ impl Viewer {
         } else {
             (used as f64 / cap as f64).clamp(0., 1.)
         };
+        let storage_open = state_bool(&self.data, "home.storage-open", false);
+        let issues_open = state_bool(&self.data, "home.ingestion-open", false);
+        let rejections = stats["rejections"].as_array().cloned().unwrap_or_default();
         let mut section = div()
             .id("home-storage-issues")
             .flex()
             .flex_col()
             .gap_1()
-            .p_3()
+            .pt_2()
             .border_t_1()
             .border_color(color(p.chrome))
-            .child(widgets::heading("Storage", p))
-            .child(widgets::property(
+            .child(
+                widgets::button("home-storage-toggle")
+                    .label("Storage")
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.data.insert(
+                            "home.storage-open".into(),
+                            json!(!state_bool(&this.data, "home.storage-open", false)),
+                        );
+                        cx.notify();
+                    })),
+            );
+        if storage_open {
+            section = section.child(widgets::property(
                 "Usage",
                 if storage["inMemory"] == true {
                     format!("{} · in memory", human_bytes(&storage["sizeBytes"]))
@@ -1319,26 +1686,36 @@ impl Viewer {
                 },
                 p,
             ));
-        if cap > 0 {
-            section = section.child(
-                div().h(px(6.)).rounded_full().bg(color(p.chrome)).child(
-                    div()
-                        .w(relative(percent as f32))
-                        .h_full()
-                        .rounded_full()
-                        .bg(color(p.accent)),
-                ),
-            );
+            if cap > 0 {
+                section = section.child(
+                    div().h(px(6.)).rounded_full().bg(color(p.chrome)).child(
+                        div()
+                            .w(relative(percent as f32))
+                            .h_full()
+                            .rounded_full()
+                            .bg(color(p.accent)),
+                    ),
+                );
+            }
         }
-        let rejections = stats["rejections"].as_array().cloned().unwrap_or_default();
-        section = section.child(widgets::heading(
-            if rejections.is_empty() {
-                "Ingestion".into()
-            } else {
-                format!("Ingestion issues · {}", rejections.len())
-            },
-            p,
-        ));
+        section = section.child(
+            widgets::button("home-ingestion-toggle")
+                .label(if rejections.is_empty() {
+                    "Ingestion issues · 0".to_owned()
+                } else {
+                    format!("Ingestion issues · {}", rejections.len())
+                })
+                .on_click(cx.listener(|this, _, _, cx| {
+                    this.data.insert(
+                        "home.ingestion-open".into(),
+                        json!(!state_bool(&this.data, "home.ingestion-open", false)),
+                    );
+                    cx.notify();
+                })),
+        );
+        if !issues_open {
+            return section.into_any_element();
+        }
         if rejections.is_empty() {
             section = section.child(
                 div()
@@ -1376,7 +1753,7 @@ impl Viewer {
                                 .flex()
                                 .gap_1()
                                 .child(
-                                    Button::new(("issue-signal", index))
+                                    widgets::button(("issue-signal", index))
                                         .label(format!("View {signal} services"))
                                         .on_click(cx.listener(move |this, _, _, cx| {
                                             this.data
@@ -1388,7 +1765,7 @@ impl Viewer {
                                         })),
                                 )
                                 .child(
-                                    Button::new(("copy-issue", index))
+                                    widgets::button(("copy-issue", index))
                                         .label("Copy sample")
                                         .on_click(move |_, _, cx| {
                                             cx.write_to_clipboard(ClipboardItem::new_string(
@@ -1410,70 +1787,125 @@ impl Viewer {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let p = palette(self.prefs.dark);
-        let mut map = div().flex().flex_col().flex_1().min_h_0().child(
+        let selected_service_sort = state_text(&self.data, "home.service-sort", "name");
+        let service_direction = state_text(&self.data, "home.service-direction", "asc");
+        let issue_signal = state_text(&self.data, "home.issue-signal", "");
+        let scale = service_map_scale(&self.data);
+        let map_view =
             div()
+                .id("service-map-view")
+                .test_support()
+                .role(Role::Group)
+                .aria_label("Service map view")
                 .flex()
                 .items_center()
-                .justify_between()
-                .p_3()
-                .child(widgets::heading("Service map", p))
-                .child(format!(
-                    "{} services · {} directed connections",
-                    services.len(),
-                    connections.len()
+                .gap_0()
+                .child(widgets::button("service-map-pan-left").label("←").on_click(
+                    cx.listener(|this, _, _, cx| this.change_service_map_view("left", cx)),
                 ))
-                .children(home_services_have_more(&self.data).then(|| {
-                    Button::new("home-more-services-map")
-                        .label("More services")
-                        .on_click(cx.listener(|this, _, _, cx| this.load_more_home_services(cx)))
-                }))
-                .child({
-                    let scale = service_map_scale(&self.data);
-                    div()
-                        .id("service-map-view")
-                        .test_support()
-                        .role(Role::Group)
-                        .aria_label("Service map view")
-                        .flex()
-                        .items_center()
-                        .gap_1()
-                        .child(Button::new("service-map-pan-left").label("←").on_click(
-                            cx.listener(|this, _, _, cx| this.change_service_map_view("left", cx)),
-                        ))
-                        .child(Button::new("service-map-pan-up").label("↑").on_click(
-                            cx.listener(|this, _, _, cx| this.change_service_map_view("up", cx)),
-                        ))
-                        .child(Button::new("service-map-pan-down").label("↓").on_click(
-                            cx.listener(|this, _, _, cx| this.change_service_map_view("down", cx)),
-                        ))
-                        .child(Button::new("service-map-pan-right").label("→").on_click(
+                .child(
+                    widgets::button("service-map-pan-up").label("↑").on_click(
+                        cx.listener(|this, _, _, cx| this.change_service_map_view("up", cx)),
+                    ),
+                )
+                .child(widgets::button("service-map-pan-down").label("↓").on_click(
+                    cx.listener(|this, _, _, cx| this.change_service_map_view("down", cx)),
+                ))
+                .child(
+                    widgets::button("service-map-pan-right")
+                        .label("→")
+                        .on_click(
                             cx.listener(|this, _, _, cx| this.change_service_map_view("right", cx)),
-                        ))
-                        .child(Button::new("service-map-zoom-out").label("−").on_click(
-                            cx.listener(|this, _, _, cx| {
-                                this.change_service_map_view("zoom-out", cx)
-                            }),
-                        ))
-                        .child(format!("{}%", (scale * 100.).round() as u32))
-                        .child(
-                            Button::new("service-map-zoom-in")
-                                .label("+")
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    this.change_service_map_view("zoom-in", cx)
-                                })),
-                        )
-                        .child(Button::new("service-map-fit").label("Fit").on_click(
-                            cx.listener(|this, _, _, cx| this.change_service_map_view("fit", cx)),
-                        ))
-                        .children(self.has_more_connections().then(|| {
-                            Button::new("more-service-connections")
-                                .label("More connections")
-                                .on_click(
-                                    cx.listener(|this, _, _, cx| this.load_more_connections(cx)),
-                                )
-                        }))
-                }),
-        );
+                        ),
+                )
+                .child(widgets::button("service-map-zoom-out").label("−").on_click(
+                    cx.listener(|this, _, _, cx| this.change_service_map_view("zoom-out", cx)),
+                ))
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(color(p.subtle))
+                        .px_1()
+                        .child(format!("{}%", (scale * 100.).round() as u32)),
+                )
+                .child(widgets::button("service-map-zoom-in").label("+").on_click(
+                    cx.listener(|this, _, _, cx| this.change_service_map_view("zoom-in", cx)),
+                ))
+                .child(widgets::button("service-map-fit").label("Fit").on_click(
+                    cx.listener(|this, _, _, cx| this.change_service_map_view("fit", cx)),
+                ));
+        let filter = div()
+            .flex()
+            .items_center()
+            .gap_1()
+            .flex_1()
+            .min_w_0()
+            .child(Input::new(&self.home_filter));
+        let mut map = div()
+            .id("home-service-map")
+            .flex()
+            .flex_col()
+            .flex_1()
+            .min_h_0()
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .gap_2()
+                    .px_2()
+                    .h(px(48.))
+                    .mb_2()
+                    .rounded_lg()
+                    .bg(color(p.panel))
+                    .child(div().text_sm().child("Service map"))
+                    .child(
+                        div()
+                            .id("home-service-count")
+                            .text_xs()
+                            .text_color(color(p.subtle))
+                            .aria_label(format!(
+                                "{} services · {} directed connections",
+                                services.len(),
+                                connections.len()
+                            ))
+                            .child(format!("{} / {}", services.len(), connections.len())),
+                    )
+                    .child(map_view),
+            )
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_1()
+                    .px_2()
+                    .child(filter)
+                    .child(
+                        widgets::button("home-service-sort")
+                            .label(format!("{} {}", selected_service_sort, service_direction))
+                            .on_click(cx.listener(|this, _, _, cx| this.cycle_service_sort(cx))),
+                    )
+                    .children((!issue_signal.is_empty()).then(|| {
+                        widgets::button("clear-issue-filter")
+                            .label(format!("{issue_signal} ×"))
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.data.remove("home.issue-signal");
+                                cx.notify();
+                            }))
+                    }))
+                    .children(home_services_have_more(&self.data).then(|| {
+                        widgets::button("home-more-services-map")
+                            .label("More")
+                            .on_click(
+                                cx.listener(|this, _, _, cx| this.load_more_home_services(cx)),
+                            )
+                    }))
+                    .children(self.has_more_connections().then(|| {
+                        widgets::button("more-service-connections")
+                            .label("More connections")
+                            .on_click(cx.listener(|this, _, _, cx| this.load_more_connections(cx)))
+                    })),
+            );
         if services.is_empty() {
             let stats = self.data.get("getStats").cloned().unwrap_or(Value::Null);
             let rejections = stats["rejections"].as_array().map_or(0, Vec::len);
@@ -1496,7 +1928,7 @@ impl Viewer {
                         p,
                     ))
                     .child(
-                        Button::new("copy-otlp-http-env")
+                        widgets::button("copy-otlp-http-env")
                             .label("Copy HTTP SDK environment")
                             .on_click(move |_, _, cx| {
                                 cx.write_to_clipboard(ClipboardItem::new_string(http_env.clone()))
@@ -1504,7 +1936,7 @@ impl Viewer {
                     )
                     .child(widgets::property("OTLP gRPC", grpc_endpoint.clone(), p))
                     .child(
-                        Button::new("copy-otlp-grpc-env")
+                        widgets::button("copy-otlp-grpc-env")
                             .label("Copy gRPC SDK environment")
                             .on_click(move |_, _, cx| {
                                 cx.write_to_clipboard(ClipboardItem::new_string(grpc_env.clone()))
@@ -1526,71 +1958,8 @@ impl Viewer {
             map = map.child(getting_started);
         } else {
             map = map.child(self.service_graph(services, connections, cx));
-            let mut cards = div()
-                .id("service-map-cards")
-                .flex()
-                .flex_wrap()
-                .gap_2()
-                .p_3()
-                .max_h(px(240.))
-                .overflow_y_scroll();
-            for (index, service) in services.iter().enumerate() {
-                cards = cards.child(self.service_card(service, index, cx));
-            }
-            map = map.child(cards);
-            map = map.child(self.connection_list(connections, cx));
         }
         map.into_any_element()
-    }
-
-    fn service_card(&self, service: &Value, index: usize, cx: &mut Context<Self>) -> AnyElement {
-        let p = palette(self.prefs.dark);
-        let name = field(service, "serviceName");
-        let namespace = field(service, "serviceNamespace");
-        let identity = service_identity(service);
-        let stroke = service_color(&identity, self.prefs.dark);
-        div()
-            .id(("service-card", index))
-            .test_support()
-            .role(Role::Button)
-            .aria_label(service_label(service))
-            .aria_selected(
-                self.data
-                    .get("home.selected-identity")
-                    .and_then(Value::as_str)
-                    == Some(identity.as_str()),
-            )
-            .w(relative(0.48))
-            .min_w(px(210.))
-            .flex()
-            .flex_col()
-            .gap_1()
-            .p_3()
-            .rounded_md()
-            .border_l_2()
-            .border_color(color(stroke))
-            .bg(color(p.panel))
-            .cursor_pointer()
-            .on_click(cx.listener(move |this, _, _, cx| {
-                this.select_service(name.clone(), namespace.clone(), identity.clone(), cx)
-            }))
-            .child(div().text_ellipsis().child(service_label(service)))
-            .child(
-                div()
-                    .flex()
-                    .gap_2()
-                    .text_xs()
-                    .text_color(color(p.subtle))
-                    .child(display_count(service, "traces"))
-                    .child(display_count(service, "logs"))
-                    .child(display_count(service, "metrics")),
-            )
-            .child(div().text_xs().text_color(color(p.subtle)).child(format!(
-                "{} spans · {} datapoints",
-                field(service, "spanCount"),
-                field(service, "dataPointCount")
-            )))
-            .into_any_element()
     }
 
     fn service_graph(
@@ -1603,54 +1972,18 @@ impl Viewer {
         let count = services.len();
         let scale = service_map_scale(&self.data);
         let pan = service_map_pan(&self.data);
-        let positions: Vec<(f32, f32)> = services
-            .iter()
-            .enumerate()
-            .map(|(i, _)| {
-                let angle = i as f32 / count.max(1) as f32 * std::f32::consts::TAU
-                    - std::f32::consts::FRAC_PI_2;
-                project_map_point(
-                    (0.5 + angle.cos() * 0.36, 0.5 + angle.sin() * 0.36),
-                    scale,
-                    pan,
-                )
-            })
-            .collect();
-        let edges: Vec<_> = connections
-            .iter()
-            .filter_map(|edge| {
-                let source_id = service_identity(&edge["source"]);
-                let target_id = service_identity(&edge["target"]);
-                let source = services
-                    .iter()
-                    .position(|service| service_identity(service) == source_id)?;
-                let target = services
-                    .iter()
-                    .position(|service| service_identity(service) == target_id)?;
-                Some((
-                    positions[source],
-                    positions[target],
-                    edge["spanCount"].as_u64().unwrap_or(1),
-                ))
-            })
-            .collect();
-        let edge_hits: Vec<_> = connections
-            .iter()
-            .filter_map(|edge| {
-                let source_id = service_identity(&edge["source"]);
-                let target_id = service_identity(&edge["target"]);
-                let source = services
-                    .iter()
-                    .position(|service| service_identity(service) == source_id)?;
-                let target = services
-                    .iter()
-                    .position(|service| service_identity(service) == target_id)?;
-                Some((edge.clone(), positions[source], positions[target]))
-            })
-            .collect();
+        let rows = count.div_ceil(2).max(1);
+        let graph_height = (rows as f32 * 64. + 24.).max(320.);
+        let positions = service_map_positions(services, scale, pan);
         let canvas_bounds: Rc<Cell<Option<Bounds<Pixels>>>> = Rc::new(Cell::new(None));
         let click_bounds = canvas_bounds.clone();
-        let click_edges = edge_hits.clone();
+        let drag_bounds = canvas_bounds.clone();
+        let route_services = services.to_vec();
+        let route_connections = connections.to_vec();
+        let click_services = route_services.clone();
+        let click_connections = route_connections.clone();
+        let click_scale = scale;
+        let click_pan = pan;
         let mut graph = div()
             .id("service-map-canvas")
             .test_support()
@@ -1658,17 +1991,24 @@ impl Viewer {
             .aria_label("Service map canvas; drag empty space to pan")
             .relative()
             .flex_1()
-            .min_h(px(320.))
+            .min_h(px(graph_height))
             .m_3()
             .on_mouse_down(
                 MouseButton::Left,
-                cx.listener(|this, event: &MouseDownEvent, _, cx| {
+                cx.listener(move |this, event: &MouseDownEvent, _, cx| {
+                    let Some(bounds) = drag_bounds.get() else {
+                        return;
+                    };
                     let (pan_x, pan_y) = service_map_pan(&this.data);
                     this.data.insert(
                         "home.map.drag".into(),
                         json!({
                             "x": f32::from(event.position.x),
                             "y": f32::from(event.position.y),
+                            "canvasX": f32::from(bounds.origin.x),
+                            "canvasY": f32::from(bounds.origin.y),
+                            "canvasWidth": f32::from(bounds.size.width),
+                            "canvasHeight": f32::from(bounds.size.height),
                             "panX": pan_x,
                             "panY": pan_y
                         }),
@@ -1676,16 +2016,15 @@ impl Viewer {
                     cx.notify();
                 }),
             )
-            .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, window, cx| {
+            .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, _, cx| {
                 if event.pressed_button != Some(MouseButton::Left) {
                     return;
                 }
                 let Some(drag) = this.data.get("home.map.drag").cloned() else {
                     return;
                 };
-                let viewport = window.viewport_size();
-                let width = f32::from(viewport.width).max(1.);
-                let height = f32::from(viewport.height).max(1.);
+                let width = drag["canvasWidth"].as_f64().unwrap_or(1.).max(1.) as f32;
+                let height = drag["canvasHeight"].as_f64().unwrap_or(1.).max(1.) as f32;
                 let x = f32::from(event.position.x);
                 let y = f32::from(event.position.y);
                 let pan_x = drag["panX"].as_f64().unwrap_or(0.) as f32
@@ -1717,10 +2056,20 @@ impl Viewer {
                 }
                 let position = event.position();
                 let point = (
-                    f32::from(position.x - bounds.origin.x) / f32::from(bounds.size.width),
-                    f32::from(position.y - bounds.origin.y) / f32::from(bounds.size.height),
+                    f32::from(position.x - bounds.origin.x),
+                    f32::from(position.y - bounds.origin.y),
                 );
-                if let Some(edge) = hit_test_connection(&click_edges, point, 0.018) {
+                let width = f32::from(bounds.size.width);
+                let height = f32::from(bounds.size.height);
+                let routes = service_map_routes(
+                    &click_services,
+                    &click_connections,
+                    click_scale,
+                    click_pan,
+                    width,
+                    height,
+                );
+                if let Some(edge) = hit_test_service_map_edges(&routes, point, 6.) {
                     this.select_connection(edge, cx);
                     cx.stop_propagation();
                 }
@@ -1730,28 +2079,42 @@ impl Viewer {
                     |_, _, _| (),
                     move |bounds, _, window, _| {
                         canvas_bounds.set(Some(bounds));
-                        for (a, b, weight) in &edges {
-                            let start = bounds.origin
-                                + point(bounds.size.width * a.0, bounds.size.height * a.1);
-                            let end = bounds.origin
-                                + point(bounds.size.width * b.0, bounds.size.height * b.1);
-                            let dx = f32::from(end.x - start.x);
-                            let dy = f32::from(end.y - start.y);
+                        let routes = service_map_routes(
+                            &route_services,
+                            &route_connections,
+                            scale,
+                            pan,
+                            f32::from(bounds.size.width),
+                            f32::from(bounds.size.height),
+                        );
+                        for route in &routes {
+                            let mut path =
+                                PathBuilder::stroke(px(if route.weight > 1 { 2. } else { 1.5 }));
+                            path.move_to(
+                                bounds.origin + point(px(route.points[0].0), px(route.points[0].1)),
+                            );
+                            path.line_to(
+                                bounds.origin + point(px(route.points[1].0), px(route.points[1].1)),
+                            );
+                            path.line_to(
+                                bounds.origin + point(px(route.points[2].0), px(route.points[2].1)),
+                            );
+                            let start = route.points[2];
+                            let end = route.points[3];
+                            let dx = end.0 - start.0;
+                            let dy = end.1 - start.1;
                             let length = (dx * dx + dy * dy).sqrt().max(1.);
                             let ux = dx / length;
                             let uy = dy / length;
-                            let tip = point(end.x - px(24.) * ux, end.y - px(24.) * uy);
+                            let tip = point(px(end.0 - 10. * ux), px(end.1 - 10. * uy));
                             let base = point(tip.x - px(9.) * ux, tip.y - px(9.) * uy);
                             let side = 4. * px(1.);
                             let left = point(base.x - side * uy, base.y + side * ux);
                             let right = point(base.x + side * uy, base.y - side * ux);
-                            let mut path =
-                                PathBuilder::stroke(px(if *weight > 1 { 2. } else { 1.5 }));
-                            path.move_to(start);
-                            path.line_to(tip);
-                            path.move_to(left);
-                            path.line_to(tip);
-                            path.line_to(right);
+                            path.line_to(bounds.origin + tip);
+                            path.move_to(bounds.origin + left);
+                            path.line_to(bounds.origin + tip);
+                            path.line_to(bounds.origin + right);
                             if let Ok(path) = path.build() {
                                 window.paint_path(path, color(p.subtle));
                             }
@@ -1765,68 +2128,111 @@ impl Viewer {
             let name = field(service, "serviceName");
             let namespace = field(service, "serviceNamespace");
             let identity = service_identity(service);
+            let selected = self
+                .data
+                .get("home.selected-identity")
+                .and_then(Value::as_str)
+                == Some(identity.as_str());
+            let node_color = service_color(&name, self.prefs.dark);
+            let label = if name.is_empty() {
+                "(unnamed)".to_owned()
+            } else if field(service, "serviceNameKind") == "string" {
+                name.clone()
+            } else {
+                format!("{} · {}", name, field(service, "serviceNameKind"))
+            };
+            let click_name = name.clone();
+            let click_namespace = namespace.clone();
+            let click_identity = identity.clone();
             graph = graph.child(
                 div()
+                    .id(("service-card", index))
+                    .test_support()
+                    .role(Role::Group)
+                    .aria_label(label.clone())
+                    .w(relative(0.42))
                     .absolute()
-                    .left(relative(x - 0.13))
-                    .top(relative(y - 0.04))
-                    .w(relative((0.26 * scale).clamp(0.14, 0.6)))
+                    .left(relative(x - 0.21))
+                    .top(relative(y))
+                    .mt(px(-30.))
                     .child(
-                        Button::new(("graph-node", index))
-                            .label(name.clone())
+                        div()
+                            .id(("graph-node", index))
+                            .test_support()
+                            .role(Role::Button)
+                            .aria_label(label.clone())
+                            .aria_selected(selected)
+                            .flex()
+                            .flex_col()
+                            .gap_1()
+                            .px_2()
+                            .py_1()
+                            .rounded_md()
+                            .border_l_2()
+                            .border_color(color(node_color))
+                            .bg(color(if selected { p.selection } else { p.panel }))
+                            .cursor_pointer()
                             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 this.select_service(
-                                    name.clone(),
-                                    namespace.clone(),
-                                    identity.clone(),
+                                    click_name.clone(),
+                                    click_namespace.clone(),
+                                    click_identity.clone(),
                                     cx,
                                 );
                                 cx.stop_propagation();
-                            })),
+                            }))
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .gap_1()
+                                    .child(div().size(px(6.)).rounded_full().bg(color(node_color)))
+                                    .child(
+                                        div()
+                                            .flex_1()
+                                            .min_w_0()
+                                            .text_size(px(11.))
+                                            .text_ellipsis()
+                                            .child(label),
+                                    )
+                                    .children(
+                                        (service["errorSpanCount"].as_u64().unwrap_or(0) > 0).then(
+                                            || {
+                                                div()
+                                                    .ml_auto()
+                                                    .text_xs()
+                                                    .text_color(color(p.error))
+                                                    .child(format!(
+                                                        "{} err",
+                                                        service["errorSpanCount"]
+                                                            .as_u64()
+                                                            .unwrap_or(0)
+                                                    ))
+                                            },
+                                        ),
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .flex()
+                                    .gap_1()
+                                    .text_size(px(9.))
+                                    .text_color(color(p.subtle))
+                                    .child(display_count(service, "traces"))
+                                    .child("·")
+                                    .child(display_count(service, "metrics"))
+                                    .child("·")
+                                    .child(display_count(service, "logs")),
+                            )
+                            .h(px(60.)),
                     ),
             );
         }
         graph.into_any_element()
     }
 
-    fn connection_list(&self, connections: &[Value], cx: &mut Context<Self>) -> AnyElement {
-        let p = palette(self.prefs.dark);
-        let mut list = div()
-            .id("service-connections")
-            .flex()
-            .flex_col()
-            .max_h(px(220.))
-            .overflow_y_scroll()
-            .border_t_1()
-            .border_color(color(p.chrome))
-            .child(widgets::heading("Directed connections · span evidence", p));
-        for (index, edge) in connections.iter().enumerate() {
-            let source = service_label(&edge["source"]);
-            let target = service_label(&edge["target"]);
-            let edge_for_click = edge.clone();
-            list = list.child(
-                Button::new(("connection", index))
-                    .label(format!(
-                        "{source} → {target} · {} spans · {} errors",
-                        field(edge, "spanCount"),
-                        field(edge, "errorSpanCount")
-                    ))
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.select_connection(edge_for_click.clone(), cx)
-                    })),
-            );
-        }
-        if connections.is_empty() {
-            list = list.child(widgets::empty(
-                "No directed connections were recorded in this time range.",
-                p,
-            ));
-        }
-        list.into_any_element()
-    }
-
-    fn render_connection_details(&self, width: f32, cx: &mut Context<Self>) -> AnyElement {
+    fn render_connection_details(&self, cx: &mut Context<Self>) -> AnyElement {
         let p = palette(self.prefs.dark);
         let spans = discovery_rows(
             self.data
@@ -1843,14 +2249,11 @@ impl Viewer {
             .test_support()
             .role(Role::Group)
             .aria_label("Connection evidence")
-            .w(px(width))
-            .min_w(px(150.))
+            .min_w_0()
             .h_full()
             .flex()
             .flex_col()
             .overflow_y_scroll()
-            .bg(color(p.panel))
-            .rounded_lg()
             .child(widgets::heading("Connection evidence", p));
         if !edge.is_null() {
             details = details.child(widgets::property("From", service_label(&edge["source"]), p));
@@ -1863,7 +2266,7 @@ impl Viewer {
             for (index, span) in spans.iter().enumerate() {
                 let trace_id = field(span, "traceID");
                 details = details.child(
-                    Button::new(("connection-span", index))
+                    widgets::button(("connection-span", index))
                         .label(format!(
                             "{} · {}",
                             field(span, "name"),
@@ -1916,28 +2319,34 @@ impl Viewer {
         .unwrap_or_else(
             || json!({"serviceName":name,"serviceNamespace":namespace,"serviceIdentity":identity}),
         );
-        let mut main = div().flex().flex_col().flex_1().min_w_0().min_h_0().child(
-            div()
-                .flex()
-                .items_center()
-                .justify_between()
-                .gap_2()
-                .p_3()
-                .child(widgets::heading(
-                    format!("{} · attributes", service_label(&selected_service)),
-                    p,
-                ))
-                .child(
-                    Button::new("service-map-back")
-                        .label("Service map")
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            this.selected_service = None;
-                            this.data.remove("home.selected-identity");
-                            this.data.remove("home.selected-edge");
-                            cx.notify();
-                        })),
-                ),
-        );
+        let mut main = div()
+            .id("home-attributes")
+            .flex()
+            .flex_col()
+            .flex_1()
+            .min_w_0()
+            .min_h_0()
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .gap_2()
+                    .p_3()
+                    .child(widgets::heading(
+                        format!("Attributes · {}", service_label(&selected_service)),
+                        p,
+                    ))
+                    .child(
+                        widgets::button("service-map-back")
+                            .label("Telemetry")
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.data
+                                    .insert("home.details-tab".into(), json!("telemetry"));
+                                cx.notify();
+                            })),
+                    ),
+            );
 
         let mut controls = div()
             .flex()
@@ -1949,7 +2358,7 @@ impl Viewer {
         for tab in SIGNALS {
             let selected = tab == signal;
             controls = controls.child(
-                Button::new(format!("attribute-signal-{tab}"))
+                widgets::button(format!("attribute-signal-{tab}"))
                     .label(if selected {
                         format!("• {tab}")
                     } else {
@@ -1962,12 +2371,12 @@ impl Viewer {
         }
         controls = controls
             .child(
-                Button::new("attribute-owner")
+                widgets::button("attribute-owner")
                     .label(format!("Owner: {owner} ▾"))
                     .on_click(cx.listener(|this, _, _, cx| this.cycle_discovery_owner(cx))),
             )
             .child(
-                Button::new("attribute-sort")
+                widgets::button("attribute-sort")
                     .label(format!(
                         "Values: {} {}",
                         state_text(&self.data, "home.values-sort", "frequency"),
@@ -1977,7 +2386,7 @@ impl Viewer {
             );
         if self.data.get("home.telemetry-scope").is_some() {
             controls = controls.child(
-                Button::new("clear-attribute-scope")
+                widgets::button("clear-attribute-scope")
                     .label("Clear telemetry scope")
                     .on_click(cx.listener(|this, _, _, cx| {
                         this.data.remove("home.telemetry-scope");
@@ -2007,7 +2416,7 @@ impl Viewer {
                 p,
             ))
             .child(
-                Button::new("home-keys-sort")
+                widgets::button("home-keys-sort")
                     .label(format!(
                         "Sort: {} {}",
                         state_text(&self.data, &format!("home.keys-sort.{signal}"), "name"),
@@ -2019,14 +2428,14 @@ impl Viewer {
                     })),
             )
             .child(
-                Button::new("expand-all-attribute-values")
+                widgets::button("expand-all-attribute-values")
                     .label("Expand all on page")
                     .on_click(
                         cx.listener(|this, _, _, cx| this.set_all_attributes_expanded(true, cx)),
                     ),
             )
             .child(
-                Button::new("collapse-all-attribute-values")
+                widgets::button("collapse-all-attribute-values")
                     .label("Collapse all")
                     .on_click(
                         cx.listener(|this, _, _, cx| this.set_all_attributes_expanded(false, cx)),
@@ -2083,7 +2492,7 @@ impl Viewer {
                                 number(&key["relativeFrequency"]).unwrap_or(0.) * 100.
                             )))
                             .child(
-                                Button::new(("toggle-attribute-values", index))
+                                widgets::button(("toggle-attribute-values", index))
                                     .label(if expanded { "Hide" } else { "Values" })
                                     .on_click(cx.listener({
                                         let key = entry.clone();
@@ -2093,7 +2502,7 @@ impl Viewer {
                                     })),
                             )
                             .child(
-                                Button::new(("copy-attribute-key", index))
+                                widgets::button(("copy-attribute-key", index))
                                     .label("Copy")
                                     .on_click(move |_, _, cx| {
                                         cx.write_to_clipboard(ClipboardItem::new_string(
@@ -2147,7 +2556,7 @@ impl Viewer {
                             .child(div().flex_1().min_w_0().text_ellipsis().child(copy.clone()))
                             .child(format!("{} records", field(row, "count")))
                             .child(
-                                Button::new(("scope-preview-value", index * 100 + value_index))
+                                widgets::button(("scope-preview-value", index * 100 + value_index))
                                     .label("Scope")
                                     .on_click(cx.listener(move |this, _, _, cx| {
                                         this.scope_telemetry_to_attribute_value(
@@ -2158,7 +2567,7 @@ impl Viewer {
                                     })),
                             )
                             .child(
-                                Button::new(("copy-preview-value", index * 100 + value_index))
+                                widgets::button(("copy-preview-value", index * 100 + value_index))
                                     .label("Copy")
                                     .on_click(move |_, _, cx| {
                                         cx.write_to_clipboard(ClipboardItem::new_string(
@@ -2176,7 +2585,7 @@ impl Viewer {
                     let key = entry.clone();
                     let next_offset = offset + preview_rows.len();
                     preview_list = preview_list.child(
-                        Button::new(("more-preview-values", index))
+                        widgets::button(("more-preview-values", index))
                             .label("More values")
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 this.load_attribute_preview(&key, next_offset, cx)
@@ -2204,7 +2613,7 @@ impl Viewer {
                 .gap_1()
                 .p_2()
                 .child(
-                    Button::new("home-keys-prev")
+                    widgets::button("home-keys-prev")
                         .label("Previous")
                         .on_click(cx.listener(move |this, _, _, cx| {
                             let current =
@@ -2228,7 +2637,7 @@ impl Viewer {
                     }
                 ))
                 .child(
-                    Button::new("home-keys-next")
+                    widgets::button("home-keys-next")
                         .label("Next")
                         .on_click(cx.listener(move |this, _, _, cx| {
                             if key_can_next {
@@ -2242,7 +2651,7 @@ impl Viewer {
                         })),
                 )
                 .child(
-                    Button::new("home-keys-page-size")
+                    widgets::button("home-keys-page-size")
                         .label(format!("{key_size} per page"))
                         .on_click(cx.listener(move |this, _, _, cx| {
                             let current = page_size(&this.data, &format!("keys.{key_signal_size}"));
@@ -2347,14 +2756,14 @@ impl Viewer {
                         ratio * 100.
                     ))
                     .child(
-                        Button::new(("scope-attribute-value", index))
+                        widgets::button(("scope-attribute-value", index))
                             .label("Scope")
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 this.scope_telemetry_to_value(scope_value.clone(), cx)
                             })),
                     )
                     .child(
-                        Button::new(("copy-attribute-value", index))
+                        widgets::button(("copy-attribute-value", index))
                             .label("Copy")
                             .on_click(move |_, _, cx| {
                                 cx.write_to_clipboard(ClipboardItem::new_string(exact.clone()))
@@ -2377,7 +2786,7 @@ impl Viewer {
                     .gap_1()
                     .p_2()
                     .child(
-                        Button::new("home-values-prev")
+                        widgets::button("home-values-prev")
                             .label("Previous")
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 let current =
@@ -2402,7 +2811,7 @@ impl Viewer {
                         }
                     ))
                     .child(
-                        Button::new("home-values-next")
+                        widgets::button("home-values-next")
                             .label("Next")
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 let current =
@@ -2418,7 +2827,7 @@ impl Viewer {
                             })),
                     )
                     .child(
-                        Button::new("home-values-page-size")
+                        widgets::button("home-values-page-size")
                             .label(format!("{} per page", size))
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 let current =
@@ -2454,7 +2863,7 @@ impl Viewer {
         main.child(content).into_any_element()
     }
 
-    fn render_service_telemetry(&mut self, width: f32, cx: &mut Context<Self>) -> AnyElement {
+    fn render_service_telemetry(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let p = palette(self.prefs.dark);
         let Some((_, _)) = self.selected_service.as_ref() else {
             return div().into_any_element();
@@ -2469,72 +2878,104 @@ impl Viewer {
             .test_support()
             .role(Role::Group)
             .aria_label("Service telemetry")
-            .w(px(width))
-            .min_w(px(150.))
             .h_full()
+            .flex_1()
+            .min_w_0()
             .flex()
-            .flex_col()
-            .bg(color(p.panel))
-            .rounded_lg();
+            .flex_col();
         let scoped = self.data.get("home.telemetry-scope").cloned();
-        details = details.child(
-            div()
-                .flex()
-                .flex_col()
-                .gap_1()
-                .p_2()
-                .child(widgets::heading("Telemetry", p))
-                .child(widgets::property("Service", service_label(&service), p))
-                .children(scoped.as_ref().map(|scope| {
-                    widgets::property(
-                        "Scoped to",
-                        format!("{} = {}", field(scope, "key"), attribute(&scope["value"])),
-                        p,
-                    )
-                })),
-        );
-        let mut tabs = div().flex().flex_wrap().gap_1().p_2();
+        if let Some(scope) = scoped.as_ref() {
+            details = details.child(div().px_2().child(widgets::property(
+                "Scoped to",
+                format!("{} = {}", field(scope, "key"), attribute(&scope["value"])),
+                p,
+            )));
+        }
+        let mut tabs = div()
+            .id("home-telemetry-tabs")
+            .h(px(48.))
+            .flex()
+            .items_center()
+            .gap_1()
+            .px_2()
+            .rounded_lg()
+            .bg(color(p.panel));
         for signal in SIGNALS {
             let is_active = active == signal;
             let count = service_count(&service, signal);
+            let label = match signal {
+                "traces" => "Traces",
+                "metrics" => "Metrics",
+                _ => "Logs",
+            };
             tabs = tabs.child(
-                Button::new(format!("home-telemetry-tab-{signal}"))
-                    .label(format!("{} · {count}", signal))
+                widgets::button(format!("home-telemetry-tab-{signal}"))
+                    .label(format!("{label} [{count}]"))
+                    .selected(is_active)
                     .on_click(cx.listener(move |this, _, _, cx| {
                         this.data.insert("home.signal".into(), json!(signal));
                         cx.notify();
                     })),
             );
-            let _ = is_active;
         }
+        details = details.child(tabs);
         let sort = state_text(&self.data, &format!("home.sort.{active}"), "time");
         let direction = state_text(&self.data, &format!("home.sort-direction.{active}"), "desc");
         let size = page_size(&self.data, &active);
         let sort_signal = active.clone();
         let size_signal = active.clone();
-        tabs = tabs
-            .child(
-                Button::new("home-telemetry-sort")
-                    .label(format!("Sort: {sort} {direction}"))
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.cycle_telemetry_sort(&sort_signal, cx)
-                    })),
-            )
-            .child(
-                Button::new("home-telemetry-page-size")
-                    .label(format!("{size} per page"))
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        let current = page_size(&this.data, &size_signal);
-                        let next = PAGE_SIZES[(PAGE_SIZES
-                            .iter()
-                            .position(|v| *v == current)
-                            .unwrap_or(0)
-                            + 1)
-                            % PAGE_SIZES.len()];
-                        this.set_home_page_size(&size_signal, next, cx);
-                    })),
-            );
-        details = details.child(tabs);
+        details = details.child(
+            div()
+                .h(px(40.))
+                .flex()
+                .items_center()
+                .justify_between()
+                .gap_1()
+                .px_2()
+                .child(
+                    div()
+                        .flex_1()
+                        .text_xs()
+                        .text_color(color(p.subtle))
+                        .child(format!(
+                            "{} · {} records",
+                            match active.as_str() {
+                                "traces" => "Traces",
+                                "metrics" => "Metrics",
+                                _ => "Logs",
+                            },
+                            field(
+                                &service,
+                                match active.as_str() {
+                                    "traces" => "traceCount",
+                                    "metrics" => "metricCount",
+                                    _ => "logCount",
+                                }
+                            )
+                        )),
+                )
+                .child(
+                    widgets::button("home-telemetry-sort")
+                        .label(format!("Sort: {sort} {direction}"))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.cycle_telemetry_sort(&sort_signal, cx)
+                        })),
+                )
+                .child(
+                    widgets::button("home-telemetry-page-size")
+                        .label(format!("{size} per page"))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            let current = page_size(&this.data, &size_signal);
+                            let next = PAGE_SIZES[(PAGE_SIZES
+                                .iter()
+                                .position(|v| *v == current)
+                                .unwrap_or(0)
+                                + 1)
+                                % PAGE_SIZES.len()];
+                            this.set_home_page_size(&size_signal, next, cx);
+                        })),
+                ),
+        );
         let records = self
             .data
             .get(&format!("home.{active}"))
@@ -2597,7 +3038,7 @@ impl Viewer {
                 .gap_1()
                 .p_2()
                 .child(
-                    Button::new("home-telemetry-prev")
+                    widgets::button("home-telemetry-prev")
                         .label("Previous")
                         .on_click(cx.listener(move |this, _, _, cx| {
                             let current = page_offset(&this.data, &prev_signal);
@@ -2612,7 +3053,7 @@ impl Viewer {
                     if records.len() >= 500 { "+" } else { "" }
                 ))
                 .child(
-                    Button::new("home-telemetry-next")
+                    widgets::button("home-telemetry-next")
                         .label("Next")
                         .on_click(cx.listener(move |this, _, _, cx| {
                             let current = page_offset(&this.data, &next_signal);

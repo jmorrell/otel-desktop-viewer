@@ -20,3 +20,11 @@ Frames must be sequentially named `frame-*.png` and share the same dimensions.
 The resulting MP4 contains a description metadata field identifying it as an
 offscreen Metal-rendered sequence. The encoder does not synthesize UI states;
 all content comes from the supplied production-render frames.
+
+For a quick visual comparison at 1440×900 and 900×760, set
+`OTEL_NATIVE_VISUAL_SMOKE=1` when running the UI target. This renders all four
+public pages against the real backend and saves screenshots, but it skips the
+full interaction walkthrough and must not be reported as a full UI-test pass.
+
+After encoding a recording, inspect decoded MP4 frames from the beginning,
+middle, and end to verify orientation as well as the source PNG screenshots.

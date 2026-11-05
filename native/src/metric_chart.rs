@@ -3,6 +3,101 @@
 use crate::model::{attribute, field, ns, number};
 use serde_json::Value;
 
+/// The web viewer's discrete count ramp; zero cells use the current neutral chrome.
+#[derive(Clone, Debug)]
+pub struct CountScale {
+    pub bands: Vec<(String, u32)>,
+    thresholds: Vec<f64>,
+    empty: u32,
+}
+
+impl CountScale {
+    pub fn new(counts: impl IntoIterator<Item = f64>, dark: bool) -> Self {
+        let mut counts: Vec<_> = counts
+            .into_iter()
+            .filter(|n| n.is_finite() && *n > 0.)
+            .collect();
+        counts.sort_by(f64::total_cmp);
+        counts.dedup_by(|a, b| *a == *b);
+        let max = counts.last().copied().unwrap_or(0.);
+        let mut thresholds = Vec::new();
+        if max >= 1. {
+            let steps = counts.len().clamp(1, 12).min(max.floor() as usize);
+            if steps == 1 {
+                thresholds.push(max);
+            } else {
+                let width = ((max - 1.) / steps.min(11) as f64).ceil().max(1.);
+                let mut lower = 1.;
+                while lower < max && thresholds.len() < 11 {
+                    thresholds.push(lower);
+                    lower += width;
+                }
+                thresholds.push(max);
+            }
+        }
+        static PALETTE: std::sync::OnceLock<Value> = std::sync::OnceLock::new();
+        let palette = PALETTE.get_or_init(|| {
+            serde_json::from_str(include_str!("../assets/heatmap-palette.json"))
+                .expect("bundled heatmap palette")
+        });
+        let swatches =
+            &palette["ramps"][thresholds.len().to_string()][if dark { "night" } else { "day" }];
+        let bands = thresholds
+            .iter()
+            .enumerate()
+            .map(|(i, lo)| {
+                let hi = thresholds
+                    .get(i + 1)
+                    .map(|n| (n - 1e-9).floor())
+                    .unwrap_or(max);
+                let lo = lo.ceil();
+                let label = if lo == hi {
+                    format_count(lo)
+                } else {
+                    format!("{} – {}", format_count(lo), format_count(hi))
+                };
+                let color = u32::from_str_radix(
+                    swatches[i]
+                        .as_str()
+                        .unwrap_or("#000000")
+                        .trim_start_matches('#'),
+                    16,
+                )
+                .unwrap_or(0);
+                (label, color)
+            })
+            .collect();
+        Self {
+            bands,
+            thresholds,
+            empty: crate::theme::palette(dark).chrome,
+        }
+    }
+
+    pub fn color(&self, count: f64) -> u32 {
+        let index = self
+            .thresholds
+            .partition_point(|threshold| count >= *threshold);
+        if index == 0 {
+            self.empty
+        } else {
+            self.bands[index - 1].1
+        }
+    }
+}
+
+fn format_count(count: f64) -> String {
+    let text = format!("{count:.0}");
+    let mut result = String::new();
+    for (i, ch) in text.chars().enumerate() {
+        if i > 0 && (text.len() - i) % 3 == 0 {
+            result.push(',');
+        }
+        result.push(ch);
+    }
+    result
+}
+
 #[derive(Clone, Debug)]
 pub struct Bin {
     pub lower: f64,
@@ -79,18 +174,23 @@ pub fn histogram_bins(value: &Value) -> Vec<Bin> {
             });
         }
     }
-    if let Some(count) = number(&value["zeroCount"]).filter(|v| *v > 0.) {
-        let t = number(&value["zeroThreshold"]).unwrap_or(0.);
-        bins.push(Bin {
-            lower: -t,
-            upper: t,
-            count,
-            exact_count: value["zeroCount"]
-                .as_str()
-                .map(str::to_owned)
-                .unwrap_or_else(|| value["zeroCount"].to_string()),
-        });
-    }
+    let count = number(&value["zeroCount"]).unwrap_or(0.);
+    let t = number(&value["zeroThreshold"]).unwrap_or(0.);
+    bins.push(Bin {
+        lower: -t,
+        upper: t,
+        count,
+        exact_count: value["zeroCount"]
+            .as_str()
+            .map(str::to_owned)
+            .unwrap_or_else(|| {
+                if value["zeroCount"].is_null() {
+                    "0".into()
+                } else {
+                    value["zeroCount"].to_string()
+                }
+            }),
+    });
     bins.sort_by(|a, b| a.lower.total_cmp(&b.lower));
     bins
 }
@@ -122,6 +222,8 @@ pub struct HeatColumn {
 pub struct ChartData {
     pub curves: Vec<Curve>,
     pub columns: Vec<HeatColumn>,
+    pub heat_rows: Vec<Bin>,
+    pub exponential: bool,
     pub x_min: i128,
     pub x_max: i128,
     pub y_min: f64,
@@ -263,6 +365,19 @@ impl ChartData {
                     value: bucket.clone(),
                 })
                 .collect();
+            data.exponential = field(view, "metricType") == "ExponentialHistogram";
+            data.heat_rows = data
+                .columns
+                .iter()
+                .flat_map(|column| column.bins.iter().cloned())
+                .collect();
+            data.heat_rows.sort_by(|a, b| {
+                b.lower
+                    .total_cmp(&a.lower)
+                    .then_with(|| b.upper.total_cmp(&a.upper))
+            });
+            data.heat_rows
+                .dedup_by(|a, b| a.lower == b.lower && a.upper == b.upper);
             if quantiles {
                 for q in ["0.5", "0.9", "0.95", "0.99"] {
                     let points = data
@@ -368,6 +483,69 @@ impl ChartData {
                 distance(a).total_cmp(&distance(b))
             })
     }
+    pub fn heat_row(&self, bin: &Bin) -> Option<usize> {
+        self.heat_rows
+            .iter()
+            .position(|row| row.lower == bin.lower && row.upper == bin.upper)
+    }
+    pub fn heat_y(&self, value: f64, column: &HeatColumn) -> Option<f32> {
+        let zero_threshold = number(&column.value["zeroThreshold"]).unwrap_or(0.);
+        let zero = if self.exponential && value.abs() <= zero_threshold {
+            column
+                .bins
+                .iter()
+                .find(|b| b.lower == -zero_threshold && b.upper == zero_threshold)
+        } else {
+            None
+        };
+        let bin = zero.or_else(|| {
+            column
+                .bins
+                .iter()
+                .find(|b| b.lower <= value && value <= b.upper)
+        })?;
+        let row = self.heat_row(bin)?;
+        let fraction = if bin.lower.is_finite() && bin.upper.is_finite() && bin.upper > bin.lower {
+            if self.exponential && bin.lower * bin.upper > 0. && value != 0. {
+                (value.abs().ln() - bin.lower.abs().ln())
+                    / (bin.upper.abs().ln() - bin.lower.abs().ln())
+            } else {
+                (value - bin.lower) / (bin.upper - bin.lower)
+            }
+        } else {
+            0.5
+        };
+        Some((row as f32 + 1. - fraction.clamp(0., 1.) as f32) / self.heat_rows.len().max(1) as f32)
+    }
+    pub fn heat_bin_at<'a>(&self, column: &'a HeatColumn, y: f32) -> Option<&'a Bin> {
+        let row = self.heat_rows.get(
+            ((y.clamp(0., 1.) * self.heat_rows.len() as f32) as usize)
+                .min(self.heat_rows.len().saturating_sub(1)),
+        )?;
+        column
+            .bins
+            .iter()
+            .find(|bin| bin.lower == row.lower && bin.upper == row.upper)
+    }
+    /// Web heatmaps use one equal-width band per received aggregate, even if
+    /// the original interval durations or gaps differ.
+    pub fn heat_column_bounds(&self, index: usize) -> (f32, f32) {
+        let n = self.columns.len().max(1) as f32;
+        (index as f32 / n, (index + 1) as f32 / n)
+    }
+    pub fn heat_column_for_timestamp(&self, timestamp: i128) -> Option<usize> {
+        self.columns
+            .iter()
+            .position(|column| column.time == timestamp)
+    }
+    pub fn heat_column_at(&self, x: f32) -> Option<&HeatColumn> {
+        if self.columns.is_empty() {
+            return None;
+        }
+        let index =
+            ((x.clamp(0., 1.) * self.columns.len() as f32) as usize).min(self.columns.len() - 1);
+        self.columns.get(index)
+    }
     pub fn nearest_column(&self, x: f32) -> Option<&HeatColumn> {
         let target = self.x_min + ((self.x_max - self.x_min) as f64 * x as f64) as i128;
         self.columns
@@ -383,6 +561,29 @@ impl ChartData {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn count_scale_matches_web_bands_and_day_night_swatches() {
+        let scale = super::CountScale::new([1., 3., 5., 7., 10.], false);
+        assert_eq!(
+            scale.bands.iter().map(|v| v.0.as_str()).collect::<Vec<_>>(),
+            ["1 – 2", "3 – 4", "5 – 6", "7 – 8", "9", "10"]
+        );
+        assert_eq!(scale.color(1.), 0xf5c7c4);
+        assert_eq!(scale.color(2.), scale.color(1.));
+        assert_ne!(scale.color(9.), scale.color(10.));
+        assert_eq!(scale.color(10.), 0x6e4c8b);
+        let night = super::CountScale::new([1., 3., 5., 7., 10.], true);
+        assert_eq!(night.color(1.), 0x6e4c8b);
+        assert_eq!(night.color(10.), 0xf5c7c4);
+        let single = super::CountScale::new([12., 12.], false);
+        assert_eq!(single.bands, vec![("12".into(), 0x6e4c8b)]);
+        assert!(
+            super::CountScale::new([0., f64::NAN], false)
+                .bands
+                .is_empty()
+        );
+    }
+
     use super::*;
     use serde_json::json;
     #[test]
@@ -475,6 +676,70 @@ mod tests {
             vec!["9007199254740995", "9007199254740997", "9007199254740993"]
         );
     }
+    #[test]
+    fn exponential_zero_row_is_present_and_wins_over_overlapping_buckets() {
+        let view = json!({"metricType":"ExponentialHistogram","aggregate":[{
+            "timestamp":"10", "startTime":"0", "scale":0, "zeroThreshold":2,
+            "zeroCount":"0", "negativeBucketOffset":0, "negativeBucketCounts":["3"],
+            "positiveBucketOffset":0, "positiveBucketCounts":["4"]
+        }]});
+        let data = ChartData::from_view(&view, 0, &Default::default(), false, false, |_| 0);
+        let column = &data.columns[0];
+        let zero = column
+            .bins
+            .iter()
+            .find(|bin| bin.lower == -2. && bin.upper == 2.)
+            .unwrap();
+        assert_eq!(zero.exact_count, "0");
+        let row = data.heat_row(zero).unwrap();
+        let y = data.heat_y(-1.5, column).unwrap();
+        assert_eq!((y * data.heat_rows.len() as f32) as usize, row);
+    }
+
+    #[test]
+    fn contribution_uses_exact_aggregate_timestamp_not_interval_overlap() {
+        let view = json!({"metricType":"Histogram","aggregate":[
+            {"startTime":"0","timestamp":"100","explicitBounds":[1],"bucketCounts":[2,0]},
+            {"startTime":"50","timestamp":"150","explicitBounds":[1],"bucketCounts":[3,0]}
+        ]});
+        let data = ChartData::from_view(&view, 0, &Default::default(), false, false, |_| 0);
+        assert_eq!(data.heat_column_for_timestamp(150), Some(1));
+        assert_eq!(data.heat_column_for_timestamp(75), None);
+    }
+
+    #[test]
+    fn heatmap_bands_keep_sparse_aggregate_identity() {
+        let view = json!({"metricType":"Histogram","aggregate":[
+            {"startTime":"0","timestamp":"10","explicitBounds":[1],"bucketCounts":[2,0]},
+            {"startTime":"100","timestamp":"101","explicitBounds":[1],"bucketCounts":[3,0]},
+            {"startTime":"1000","timestamp":"1100","explicitBounds":[1],"bucketCounts":[4,0]}
+        ]});
+        let data = ChartData::from_view(&view, 0, &Default::default(), false, false, |_| 0);
+        let (left, right) = data.heat_column_bounds(1);
+        assert!((left - 1. / 3.).abs() < 0.00001);
+        assert!((right - 2. / 3.).abs() < 0.00001);
+        let selected = data.heat_column_at((left + right) / 2.).unwrap();
+        assert_eq!((selected.start, selected.time), (100, 101));
+        assert_eq!(selected.value["bucketCounts"][0], 3);
+        assert_eq!(data.heat_column_at(1.).unwrap().time, 1100);
+    }
+
+    #[test]
+    fn heatmap_uses_equal_bucket_rows_and_quantile_projection() {
+        let view = json!({"metricType":"Histogram","aggregate":[{
+            "timestamp":"10", "startTime":"0", "explicitBounds":[1, 10, 1000], "bucketCounts":[1,2,3,4]
+        }]});
+        let data = ChartData::from_view(&view, 0, &Default::default(), false, false, |_| 0);
+        let column = &data.columns[0];
+        assert_eq!(data.heat_rows.len(), 4);
+        assert_eq!(data.heat_row(&column.bins[0]), Some(3));
+        assert_eq!(data.heat_row(&column.bins[3]), Some(0));
+        assert_eq!(data.heat_bin_at(column, 0.1).unwrap().count, 4.);
+        assert_eq!(data.heat_bin_at(column, 0.9).unwrap().count, 1.);
+        assert!((data.heat_y(5.5, column).unwrap() - 0.625).abs() < 0.0001);
+        assert!((data.heat_y(2000., column).unwrap() - 0.125).abs() < 0.0001);
+    }
+
     #[test]
     fn singleton_heatmap_has_a_visible_domain_and_keeps_its_interval() {
         let mut view = json!({"metricType":"Histogram","aggregate":[{

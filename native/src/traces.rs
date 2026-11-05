@@ -5,7 +5,7 @@ use crate::{
     widgets,
 };
 use gpui_kit::{
-    component::{Disableable, button::Button},
+    component::{Disableable, IconName, Selectable},
     *,
 };
 use serde_json::{Value, json};
@@ -17,18 +17,23 @@ impl Viewer {
     pub fn render_traces(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let p = palette(self.prefs.dark);
         let (list_width, details_width) = self.pane_widths(window);
-        let available = f32::from(window.viewport_size().width)
-            - if self.prefs.list_open { list_width } else { 0. }
-            - if self.prefs.details_open {
-                details_width
-            } else {
-                0.
-            };
+        let available = if self.workspace_stacked(window) {
+            details_width
+        } else {
+            f32::from(window.viewport_size().width)
+                - 32.
+                - if self.prefs.list_open { list_width } else { 0. }
+                - if self.prefs.details_open {
+                    details_width
+                } else {
+                    0.
+                }
+        };
         self.trace_label_render_width = self
             .prefs
             .trace_label_width
             .clamp(140., (available - 120.).clamp(140., 600.));
-        let mut shell = div()
+        let shell = div()
             .id("trace-workspace")
             .test_support()
             .track_focus(&self.trace_focus)
@@ -49,7 +54,9 @@ impl Viewer {
             }))
             .flex()
             .size_full()
-            .gap_1();
+            .gap_4();
+        let mut list_pane = None;
+        let mut details_pane = None;
         if self.prefs.list_open {
             let mut list = div()
                 .id("trace-list")
@@ -58,15 +65,21 @@ impl Viewer {
                 .h_full()
                 .flex()
                 .flex_col()
-                .bg(color(p.panel))
-                .child(widgets::heading("Traces", p))
+                .bg(color(p.canvas))
                 .child(
                     div()
+                        .h(px(48.))
+                        .flex_shrink_0()
                         .flex()
-                        .gap_1()
-                        .px_2()
+                        .items_center()
+                        .rounded_lg()
+                        .bg(color(p.panel))
+                        .px_4()
+                        .mb_4()
+                        .child(div().flex_1().child("Traces"))
                         .child(
-                            Button::new("trace-sort")
+                            widgets::button("trace-sort")
+                                .icon(IconName::SortAscending)
                                 .label(
                                     [
                                         "Start time",
@@ -83,12 +96,13 @@ impl Viewer {
                                 })),
                         )
                         .child(
-                            Button::new("trace-sort-direction")
-                                .label(if self.trace_sort % 2 == 0 {
-                                    "↓"
+                            widgets::button("trace-sort-direction")
+                                .icon(if self.trace_sort % 2 == 0 {
+                                    IconName::ArrowDown
                                 } else {
-                                    "↑"
+                                    IconName::ArrowUp
                                 })
+                                .accessibility_label("Reverse trace sort")
                                 .on_click(cx.listener(|this, _, _, cx| {
                                     this.trace_sort ^= 1;
                                     this.refresh(cx);
@@ -139,8 +153,9 @@ impl Viewer {
                             }))
                             .min_w_0()
                             .overflow_hidden()
-                            .p_3()
-                            .mb_1()
+                            .px_4()
+                            .py_2()
+                            .mb_2()
                             .rounded_md()
                             .bg(color(if selected { p.selection } else { p.canvas }))
                             .cursor_pointer()
@@ -149,36 +164,78 @@ impl Viewer {
                                     this.select_trace(id.clone(), cx)
                                 }),
                             )
-                            .child(div().text_ellipsis().child(name))
                             .child(
                                 div()
-                                    .text_ellipsis()
-                                    .text_color(color(p.subtle))
-                                    .child(service_name),
+                                    .flex()
+                                    .items_center()
+                                    .justify_between()
+                                    .gap_2()
+                                    .child(
+                                        div()
+                                            .flex_1()
+                                            .min_w_0()
+                                            .text_size(px(17.))
+                                            .text_ellipsis()
+                                            .child(name),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_size(px(14.))
+                                            .text_color(color(if ns(&row["errorCount"]) > 0 {
+                                                p.error
+                                            } else {
+                                                p.subtle
+                                            }))
+                                            .child(format!(
+                                                "[{} err | {} spans]",
+                                                field(row, "errorCount"),
+                                                field(row, "spanCount")
+                                            )),
+                                    ),
                             )
+                            .child({
+                                let parts = row["serviceBreakdown"].as_array();
+                                let mut bar = div().flex().gap_1().h(px(8.)).my_2();
+                                if let Some(parts) = parts.filter(|a| !a.is_empty()) {
+                                    for part in parts {
+                                        let count = ns(&part["count"]).max(0) as f32;
+                                        if count > 0. {
+                                            bar = bar.child(
+                                                div()
+                                                    .flex_grow(count)
+                                                    .flex_basis(px(0.))
+                                                    .h_full()
+                                                    .rounded_full()
+                                                    .bg(color(crate::theme::service_color(
+                                                        &field(part, "label"),
+                                                        self.prefs.dark,
+                                                    ))),
+                                            );
+                                        }
+                                    }
+                                } else {
+                                    bar = bar.child(div().flex_1().h_full().rounded_full().bg(
+                                        color(crate::theme::service_color(
+                                            &service_name,
+                                            self.prefs.dark,
+                                        )),
+                                    ));
+                                }
+                                bar
+                            })
                             .child(
                                 div()
                                     .flex()
                                     .justify_between()
-                                    .child(
-                                        div()
-                                            .min_w_0()
-                                            .text_ellipsis()
-                                            .child(format_timestamp(ns(&row["startTime"]))),
-                                    )
-                                    .child(format_duration(ns(&row["durationNs"]))),
-                            )
-                            .child(
-                                div()
-                                    .text_color(color(if ns(&row["errorCount"]) > 0 {
-                                        p.error
-                                    } else {
-                                        p.subtle
-                                    }))
+                                    .text_size(px(14.))
+                                    .text_color(color(p.subtle))
                                     .child(format!(
-                                        "{} spans · {} errors",
-                                        field(row, "spanCount"),
-                                        field(row, "errorCount")
+                                        "Start: {}",
+                                        widgets::relative_timestamp(&row["startTime"])
+                                    ))
+                                    .child(format!(
+                                        "Duration: {}",
+                                        format_duration(ns(&row["durationNs"]))
                                     )),
                             ),
                     );
@@ -187,7 +244,7 @@ impl Viewer {
                 cards = cards.child(widgets::empty("No traces in this time range", p));
             }
             list = list.child(cards);
-            shell = shell.child(list);
+            list_pane = Some(list.into_any_element());
         }
         let mut main = div()
             .flex_1()
@@ -207,137 +264,146 @@ impl Viewer {
             .map(|n| field(&n["spanData"], "parentSpanID"))
             .filter(|id| !id.is_empty())
             .collect();
-        let title = self
-            .selected_trace
-            .clone()
+        let title = spans
+            .first()
+            .map(|n| field(&n["spanData"], "name"))
+            .filter(|s| !s.is_empty())
             .unwrap_or_else(|| "Select a trace".into());
-        main = main.child(
-            div()
-                .flex()
-                .items_center()
-                .justify_between()
-                .child(widgets::heading(title, p))
-                .child(
-                    div()
-                        .flex()
-                        .gap_1()
-                        .child(Button::new("expand-spans").label("Expand all").on_click(
-                            cx.listener(|this, _, _, cx| {
-                                let prefix = format!(
-                                    "span:{}:",
-                                    this.selected_trace.as_deref().unwrap_or_default()
-                                );
-                                this.collapsed.retain(|key| !key.starts_with(&prefix));
-                                cx.notify();
-                            }),
-                        ))
-                        .child(
-                            Button::new("collapse-spans")
-                                .label("Collapse all")
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    if let Some(spans) = this.trace_view["spans"].as_array() {
-                                        for node in spans {
-                                            this.collapsed.insert(this.span_collapse_key(&field(
-                                                &node["spanData"],
-                                                "spanID",
-                                            )));
-                                        }
-                                    }
-                                    cx.notify();
-                                })),
-                        ),
-                ),
-        );
-        if let Some(trace_id) = self.selected_trace.clone() {
-            let copy_trace_id = trace_id.clone();
-            let export_id = trace_id.clone();
-            let mut actions = div().flex().gap_1().px_2().child(
-                Button::new("export-trace")
-                    .label("Export trace")
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.export_record("traces", export_id.clone(), None, cx)
+        let errors = spans
+            .iter()
+            .filter(|n| ns(&n["spanData"]["statusCodeValue"]) == 2)
+            .count();
+        let mut header = div()
+            .h(px(48.))
+            .flex_shrink_0()
+            .flex()
+            .items_center()
+            .gap_1()
+            .px_2()
+            .rounded_lg()
+            .bg(color(p.panel))
+            .child(div().flex_1().min_w_0().text_ellipsis().child(title))
+            .child(
+                div()
+                    .text_color(color(p.subtle))
+                    .child(format!("[{} spans]", spans.len())),
+            )
+            .child(
+                widgets::button("previous-span-error")
+                    .icon(IconName::ChevronLeft)
+                    .accessibility_label("Previous error")
+                    .tooltip("Previous error")
+                    .on_click(cx.listener(|this, _, _, cx| this.navigate_span_error(false, cx))),
+            )
+            .child(
+                div()
+                    .text_color(color(p.error))
+                    .child(format!("[{errors} err]")),
+            )
+            .child(
+                widgets::button("next-span-error")
+                    .icon(IconName::ChevronRight)
+                    .accessibility_label("Next error")
+                    .tooltip("Next error")
+                    .on_click(cx.listener(|this, _, _, cx| this.navigate_span_error(true, cx))),
+            )
+            .child(
+                widgets::button("expand-spans")
+                    .icon(IconName::ChevronDown)
+                    .accessibility_label("Expand all spans")
+                    .tooltip("Expand all")
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        let prefix = format!(
+                            "span:{}:",
+                            this.selected_trace.as_deref().unwrap_or_default()
+                        );
+                        this.collapsed.retain(|k| !k.starts_with(&prefix));
+                        cx.notify();
+                    })),
+            )
+            .child(
+                widgets::button("collapse-spans")
+                    .icon(IconName::ChevronUp)
+                    .accessibility_label("Collapse all spans")
+                    .tooltip("Collapse all")
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        let spans = this.trace_view["spans"]
+                            .as_array()
+                            .cloned()
+                            .unwrap_or_default();
+                        for n in spans {
+                            this.collapsed
+                                .insert(this.span_collapse_key(&field(&n["spanData"], "spanID")));
+                        }
+                        cx.notify();
+                    })),
+            )
+            .child(
+                widgets::button("trace-matches")
+                    .icon(IconName::Settings2)
+                    .toggled(self.trace_matches_only)
+                    .selected(self.trace_matches_only)
+                    .accessibility_label("Show matching spans and ancestors")
+                    .tooltip("Show matches and ancestors")
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.trace_matches_only = !this.trace_matches_only;
+                        cx.notify();
                     })),
             );
-            actions = actions.child(Button::new("copy-trace-otlp").label("Copy OTLP").on_click(
-                cx.listener(move |this, _, _, cx| {
-                    this.copy_otlp("traces", copy_trace_id.clone(), None, cx)
-                }),
-            ));
-            if self
-                .data
-                .get("ui.trace.delete")
-                .and_then(Value::as_bool)
-                .unwrap_or(false)
-            {
-                actions = actions
+        if let Some(trace) = self.selected_trace.clone() {
+            header = header.child(
+                widgets::button("export-trace")
+                    .icon(IconName::ArrowDown)
+                    .accessibility_label("Export trace")
+                    .tooltip("Export trace")
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.export_record("traces", trace.clone(), None, cx)
+                    })),
+            );
+        }
+        main = main.child(header);
+        if self
+            .data
+            .get("ui.trace.delete")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+        {
+            let trace = self.selected_trace.clone().unwrap_or_default();
+            main = main.child(
+                div()
+                    .flex()
+                    .items_center()
+                    .flex_wrap()
+                    .child("Delete this trace and all spans?")
                     .child(
-                        div()
-                            .text_color(color(p.error))
-                            .child("Delete this trace and all its spans?"),
-                    )
-                    .child(
-                        Button::new("confirm-trace-delete")
+                        widgets::button("confirm-trace-delete")
                             .label("Delete")
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 this.rpc_key(
                                     "trace.delete",
                                     "deleteSpansByTraceID",
-                                    json!([trace_id]),
+                                    json!([trace]),
                                     cx,
                                 )
                             })),
                     )
-                    .child(Button::new("cancel-trace-delete").label("Cancel").on_click(
-                        cx.listener(|this, _, _, cx| {
-                            this.data.remove("ui.trace.delete");
-                            cx.notify();
-                        }),
-                    ));
-            } else {
-                actions =
-                    actions.child(Button::new("delete-trace").label("Delete trace").on_click(
-                        cx.listener(|this, _, _, cx| {
-                            this.data.insert("ui.trace.delete".into(), json!(true));
-                            cx.notify();
-                        }),
-                    ));
-            }
-            main = main.child(actions);
+                    .child(
+                        widgets::button("cancel-trace-delete")
+                            .label("Cancel")
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.data.remove("ui.trace.delete");
+                                cx.notify();
+                            })),
+                    ),
+            );
         }
         let unplaced = ns(&self.trace_view["unplacedSpanCount"]);
         if unplaced > 0 {
-            main=main.child(div().px_3().py_2().text_color(color(p.error)).child(format!("{unplaced} spans could not be placed in the hierarchy; inspect raw data for malformed parent links.")));
+            main = main.child(widgets::empty(
+                format!("{unplaced} unplaced spans · inspect raw data"),
+                p,
+            ));
         }
-        main =
-            main.child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap_1()
-                    .px_2()
-                    .child(
-                        Button::new("previous-span-error")
-                            .label("Previous error")
-                            .on_click(
-                                cx.listener(|this, _, _, cx| this.navigate_span_error(false, cx)),
-                            ),
-                    )
-                    .child(Button::new("next-span-error").label("Next error").on_click(
-                        cx.listener(|this, _, _, cx| this.navigate_span_error(true, cx)),
-                    )),
-            );
-        main = main.child(
-            Button::new("trace-matches")
-                .label(if self.trace_matches_only {
-                    "Show all spans"
-                } else {
-                    "Show matches and ancestors"
-                })
-                .on_click(cx.listener(|this, _, _, cx| {
-                    this.trace_matches_only = !this.trace_matches_only;
-                    cx.notify();
-                })),
-        );
         let duration = spans
             .iter()
             .map(|n| ns(&n["spanData"]["start"]) + ns(&n["spanData"]["dur"]))
@@ -348,6 +414,7 @@ impl Viewer {
             div()
                 .flex()
                 .h(px(28.))
+                .mt_4()
                 .border_b_1()
                 .border_color(color(p.chrome))
                 .child(
@@ -458,16 +525,46 @@ impl Viewer {
                 .flex_1(),
             );
         }
-        shell = shell.child(main);
+        let mut footer = div()
+            .h(px(32.))
+            .flex_shrink_0()
+            .flex()
+            .items_center()
+            .justify_between()
+            .text_color(color(p.subtle))
+            .child(format!("{} spans", spans.len()));
+        if let Some(trace) = self.selected_trace.clone() {
+            footer = footer
+                .child(
+                    widgets::button("copy-trace-otlp")
+                        .icon(IconName::Copy)
+                        .accessibility_label("Copy trace OTLP JSON")
+                        .tooltip("Copy trace OTLP JSON")
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.copy_otlp("traces", trace.clone(), None, cx)
+                        })),
+                )
+                .child(
+                    widgets::button("delete-trace")
+                        .icon(IconName::Delete)
+                        .accessibility_label("Delete trace")
+                        .tooltip("Delete trace")
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.data.insert("ui.trace.delete".into(), json!(true));
+                            cx.notify();
+                        })),
+                );
+        }
+        main = main.child(footer);
+        let main_pane = main.into_any_element();
         if self.prefs.details_open {
             let mut details = div()
                 .id("span-details")
                 .test_support()
                 .w(px(details_width))
                 .h_full()
-                .overflow_y_scroll()
-                .bg(color(p.panel))
-                .child(widgets::heading("Span details", p));
+                .min_h_0()
+                .bg(color(p.canvas));
             let selected = spans
                 .iter()
                 .find(|n| self.selected_span.as_deref() == n["spanData"]["spanID"].as_str())
@@ -499,75 +596,24 @@ impl Viewer {
                 let copy = serde_json::to_string_pretty(&exact).unwrap_or_default();
                 let trace_id = self.selected_trace.clone().unwrap_or_default();
                 let span_id = field(span, "spanID");
-                details =
-                    details.child(
-                        div()
-                            .flex()
-                            .flex_wrap()
-                            .gap_1()
-                            .p_2()
-                            .child(Button::new("copy-span").label("Copy JSON").on_click(
-                                move |_, _, cx| {
-                                    cx.write_to_clipboard(ClipboardItem::new_string(copy.clone()))
-                                },
-                            ))
-                            .child({
-                                let trace_id = trace_id.clone();
-                                let span_id = span_id.clone();
-                                Button::new("copy-span-otlp").label("Copy OTLP").on_click(
-                                    cx.listener(move |this, _, _, cx| {
-                                        this.copy_otlp(
-                                            "traces",
-                                            trace_id.clone(),
-                                            Some(json!({"spanId":span_id})),
-                                            cx,
-                                        )
-                                    }),
-                                )
-                            })
-                            .child(Button::new("export-span").label("Export").on_click(
-                                cx.listener(move |this, _, _, cx| {
-                                    this.export_record(
-                                        "traces",
-                                        trace_id.clone(),
-                                        Some(json!({"spanId":span_id})),
-                                        cx,
-                                    )
-                                }),
-                            )),
-                    );
-                if let Some(event) = self.data.get("ui.trace.event").cloned() {
-                    details = details
-                        .child(widgets::heading("Selected event", p))
-                        .child(self.detail_json("span/selected-event", &event, 0, cx));
-                }
-                let mut sections = Vec::new();
-                let mut summary = div();
+                let raw_mode = self
+                    .data
+                    .get("ui.trace.json")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+                let raw_key = format!("trace.raw.{trace_id}.{span_id}");
+                let mut primary = div().flex().flex_col().min_w_0();
+                primary = primary
+                    .child(widgets::property("name · string", field(span, "name"), p))
+                    .child(widgets::property("kind · enum", field(span, "kind"), p));
                 for (key, label) in [
-                    ("name", "Name"),
-                    ("spanID", "Span ID"),
-                    ("parentSpanID", "Parent span"),
-                    ("kind", "Kind"),
-                    ("statusCode", "Status"),
-                    ("statusMessage", "Status message"),
-                    ("traceState", "Trace state"),
-                    ("flags", "Flags"),
-                    ("droppedAttributesCount", "Dropped attributes"),
-                    ("droppedEventsCount", "Dropped events"),
-                    ("droppedLinksCount", "Dropped links"),
+                    ("startTime", "startTimeUnixNano · fixed64"),
+                    ("endTime", "endTimeUnixNano · fixed64"),
                 ] {
-                    summary = summary.child(widgets::property(label, field(span, key), p));
-                }
-                summary = summary.child(widgets::property(
-                    "Trace ID",
-                    field(&self.trace_view, "traceID"),
-                    p,
-                ));
-                for (key, label) in [("startTime", "Start time"), ("endTime", "End time")] {
-                    summary = summary.child(widgets::property_exact(
+                    primary = primary.child(widgets::property_exact(
                         label,
                         format!(
-                            "{} · {} ns",
+                            "{}\n{}",
                             format_timestamp(ns(&exact[key])),
                             field(&exact, key)
                         ),
@@ -575,88 +621,197 @@ impl Viewer {
                         p,
                     ));
                 }
-                summary = summary.child(widgets::property(
-                    "Duration",
+                primary = primary.child(widgets::property(
+                    "duration · int64",
                     format_duration(ns(&span["dur"])),
                     p,
                 ));
-                sections.push(crate::detail_stack::DetailSection::new(
-                    "summary", "Span", summary,
-                ));
+                for (key, label) in [
+                    ("statusCode", "status · enum"),
+                    ("statusMessage", "statusMessage · string"),
+                    ("spanID", "spanId · fixed64"),
+                    ("parentSpanID", "parentSpanId · fixed64"),
+                    ("traceState", "traceState · string"),
+                    ("flags", "flags · uint32"),
+                    ("droppedAttributesCount", "droppedAttributesCount · uint32"),
+                    ("droppedEventsCount", "droppedEventsCount · uint32"),
+                    ("droppedLinksCount", "droppedLinksCount · uint32"),
+                ] {
+                    primary = primary.child(widgets::property(label, field(span, key), p));
+                }
+                primary =
+                    primary.child(widgets::property("traceId · fixed128", trace_id.clone(), p));
                 for (key, label) in [
                     ("attributes", "Attributes"),
                     ("resource", "Resource"),
                     ("scope", "Scope"),
-                    ("events", "Events"),
-                    ("links", "Links"),
                 ] {
-                    let content = self.detail_json(
-                        &format!("span/{}/{key}", field(span, "spanID")),
-                        &exact[key],
-                        0,
-                        cx,
-                    );
-                    sections.push(crate::detail_stack::DetailSection::new(key, label, content));
+                    primary =
+                        primary
+                            .child(widgets::heading(label, p))
+                            .child(self.attribute_table(
+                                &format!("span/{span_id}/{key}"),
+                                &exact[key],
+                                cx,
+                            ));
                 }
-                if let Some(links) = span["links"].as_array() {
-                    for (index, link) in links.iter().enumerate() {
-                        if let Some(trace) = link["traceID"].as_str().filter(|s| !s.is_empty()) {
-                            let trace = trace.to_owned();
-                            details = details.child(
-                                Button::new(("span-linked-trace", index))
-                                    .label(format!("Open linked trace {}", trace))
-                                    .on_click(cx.listener(move |this, _, _, cx| {
-                                        this.select_trace(trace.clone(), cx)
-                                    })),
-                            );
-                        }
+                let primary = if raw_mode {
+                    let value = self
+                        .data
+                        .get(&raw_key)
+                        .and_then(|v| v["content"].as_str())
+                        .and_then(|text| serde_json::from_str::<Value>(text).ok());
+                    if let Some(value) = value {
+                        self.detail_json(&format!("span/{span_id}/otlp"), &value, 0, cx)
+                    } else {
+                        widgets::empty("Loading exact OTLP JSON…", p).into_any_element()
                     }
-                }
-                if let Some(logs) = self
+                } else {
+                    primary.into_any_element()
+                };
+                let raw_trace = trace_id.clone();
+                let raw_span = span_id.clone();
+                let request_key = raw_key.clone();
+                let mut actions=div().flex().items_center().gap_1().child(widgets::button("span-properties").label("Properties").toggled(!raw_mode).selected(!raw_mode).on_click(cx.listener(|this,_,_,cx|{this.data.insert("ui.trace.json".into(),json!(false));cx.notify();}))).child(widgets::button("span-json").label("JSON").toggled(raw_mode).selected(raw_mode).on_click(cx.listener(move|this,_,_,cx|{this.data.insert("ui.trace.json".into(),json!(true));this.rpc_key(&request_key,"native.export",json!({"signal":"traces","reference":raw_trace,"scope":{"spanId":raw_span}}),cx);}))).child(widgets::button("copy-span").icon(IconName::Copy).accessibility_label("Copy span JSON").tooltip("Copy span JSON").on_click(move|_,_,cx|cx.write_to_clipboard(ClipboardItem::new_string(copy.clone()))));
+                let otlp_trace = trace_id.clone();
+                let otlp_span = span_id.clone();
+                actions = actions.child(
+                    widgets::button("copy-span-otlp")
+                        .icon(IconName::FileText)
+                        .accessibility_label("Copy span OTLP JSON")
+                        .tooltip("Copy span OTLP JSON")
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.copy_otlp(
+                                "traces",
+                                otlp_trace.clone(),
+                                Some(json!({"spanId":otlp_span})),
+                                cx,
+                            )
+                        })),
+                );
+                actions = actions.child(
+                    widgets::button("export-span")
+                        .icon(IconName::ArrowDown)
+                        .accessibility_label("Export span")
+                        .tooltip("Export span")
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.export_record(
+                                "traces",
+                                trace_id.clone(),
+                                Some(json!({"spanId":span_id})),
+                                cx,
+                            )
+                        })),
+                );
+                let logs = self
                     .data
                     .get("span.logs")
                     .and_then(|v| v.get("logs").or(Some(v)))
                     .and_then(Value::as_array)
                     .cloned()
-                {
-                    details = details.child(widgets::heading(format!("Logs [{}]", logs.len()), p));
-                    for (index, log) in logs.iter().enumerate() {
-                        let id = field(log, "logRef");
-                        let label = crate::model::attribute(&log["body"]);
-                        details =
-                            details.child(Button::new(("span-log", index)).label(label).on_click(
+                    .unwrap_or_default();
+                let events = span["events"].as_array().cloned().unwrap_or_default();
+                let activity_count = logs.len() + events.len();
+                let mut activity = div().flex().flex_col().gap_2();
+                for (index, event) in events.iter().enumerate() {
+                    let selected_event = event.clone();
+                    activity = activity.child(
+                        div()
+                            .px_4()
+                            .py_2()
+                            .child(
+                                widgets::button(("span-event-detail", index))
+                                    .label(field(event, "name"))
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.data.insert(
+                                            "ui.trace.event".into(),
+                                            selected_event.clone(),
+                                        );
+                                        cx.notify();
+                                    })),
+                            )
+                            .child(
+                                div()
+                                    .text_color(color(p.subtle))
+                                    .child(format_timestamp(ns(&event["timestamp"]))),
+                            ),
+                    );
+                }
+                for (index, log) in logs.iter().enumerate() {
+                    let id = field(log, "logRef");
+                    let body = crate::model::attribute(&log["body"]);
+                    activity = activity.child(
+                        div()
+                            .px_4()
+                            .py_2()
+                            .child(widgets::button(("span-log", index)).label(body).on_click(
                                 cx.listener(move |this, _, _, cx| this.select_log(id.clone(), cx)),
-                            ));
+                            ))
+                            .child(div().text_color(color(p.subtle)).child(format!(
+                                "· Log · Recorded: {}",
+                                widgets::relative_timestamp(&log["timestamp"])
+                            ))),
+                    );
+                }
+                if let Some(event) = self.data.get("ui.trace.event").cloned() {
+                    activity =
+                        activity.child(self.attribute_table("span/selected-event", &event, cx));
+                }
+                let links = span["links"].as_array().cloned().unwrap_or_default();
+                let link_count = links.len();
+                let mut links_view = div().flex().flex_col();
+                for (index, link) in links.iter().enumerate() {
+                    links_view = links_view.child(self.attribute_table(
+                        &format!("span/link/{index}"),
+                        link,
+                        cx,
+                    ));
+                    if let Some(trace) = link["traceID"].as_str().filter(|s| !s.is_empty()) {
+                        let trace = trace.to_owned();
+                        links_view = links_view.child(
+                            widgets::button(("span-linked-trace", index))
+                                .label("Open linked trace")
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.select_trace(trace.clone(), cx)
+                                })),
+                        );
                     }
                 }
-                let raw = self.detail_json(
-                    &format!("span/{}/raw", field(span, "spanID")),
-                    &exact,
-                    0,
-                    cx,
-                );
-                sections.push(crate::detail_stack::DetailSection::new(
-                    "raw", "Raw JSON", raw,
-                ));
-                let otlp = self.raw_otlp_inspector(
-                    "span",
-                    "traces",
-                    self.selected_trace.clone().unwrap_or_default(),
-                    Some(json!({"spanId":field(span,"spanID")})),
-                    cx,
-                );
-                sections.push(crate::detail_stack::DetailSection::new(
-                    "otlp",
-                    "Raw OTLP JSON",
-                    otlp,
-                ));
+                let sections = vec![
+                    crate::detail_stack::DetailSection::new(
+                        "summary",
+                        if field(span, "parentSpanID").is_empty() {
+                            "Span · root"
+                        } else {
+                            "Span"
+                        },
+                        primary,
+                    )
+                    .actions(actions),
+                    crate::detail_stack::DetailSection::new(
+                        "events",
+                        format!("Events [{activity_count}]"),
+                        activity,
+                    )
+                    .initially_open(true)
+                    .available(activity_count > 0),
+                    crate::detail_stack::DetailSection::new(
+                        "links",
+                        format!("Links [{link_count}]"),
+                        links_view,
+                    )
+                    .initially_open(false)
+                    .available(link_count > 0),
+                ];
                 details = details.child(self.detail_stack("traces", sections, cx));
             } else {
                 details = details.child(widgets::empty("Select a span", p));
             }
-            shell = shell.child(details);
+            details_pane = Some(details.into_any_element());
         }
-        shell.into_any_element()
+        shell
+            .child(self.render_workspace(list_pane, main_pane, details_pane, window))
+            .into_any_element()
     }
     fn span_collapse_key(&self, id: &str) -> String {
         format!(
@@ -774,7 +929,9 @@ impl Viewer {
             .pl(px(8. + depth as f32 * 14.))
             .gap_1()
             .child(
-                Button::new(SharedString::from(format!("toggle-{id}")))
+                crate::widgets::button(SharedString::from(format!("toggle-{id}")))
+                    .w(px(20.))
+                    .h(px(20.))
                     .label(if !has_children {
                         "·"
                     } else if collapsed {
@@ -795,11 +952,14 @@ impl Viewer {
                     .flex_1()
                     .min_w_0()
                     .flex()
-                    .flex_col()
-                    .child(div().text_ellipsis().child(name))
+                    .items_center()
+                    .gap_2()
+                    .child(div().flex_1().min_w_0().text_ellipsis().child(name))
                     .child(
                         div()
-                            .text_xs()
+                            .w(px(80.))
+                            .flex_shrink_0()
+                            .text_ellipsis()
                             .text_color(color(p.subtle))
                             .child(service_name),
                     ),
@@ -807,14 +967,14 @@ impl Viewer {
         let mut timing = div()
             .relative()
             .flex_1()
-            .h(px(42.))
+            .h(px(40.))
             .child(
                 div()
                     .absolute()
                     .left(relative(offset))
                     .top(px(12.))
                     .w(relative(width))
-                    .h(px(18.))
+                    .h(px(14.))
                     .rounded_sm()
                     .bg(color(if error { p.error } else { bar_color })),
             )
@@ -933,10 +1093,8 @@ impl Viewer {
             .aria_selected(selected)
             .aria_expanded(!collapsed)
             .flex()
-            .min_h(px(44.))
+            .min_h(px(40.))
             .bg(color(if selected { p.selection } else { p.canvas }))
-            .border_b_1()
-            .border_color(color(p.chrome))
             .cursor_pointer()
             .on_click(cx.listener(move |this, _, window, cx| {
                 this.trace_focus.focus(window, cx);

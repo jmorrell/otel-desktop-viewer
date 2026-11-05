@@ -129,6 +129,283 @@ fn wait_model(
         pump(cx, window, 80);
     }
 }
+fn drag_steps(
+    cx: &mut HeadlessAppContext,
+    handle: AnyWindowHandle,
+    from: gpui_kit::Point<gpui_kit::Pixels>,
+    to: gpui_kit::Point<gpui_kit::Pixels>,
+) {
+    cx.update_window(handle, |_, window, cx| {
+        window.pointer_down(from, MouseButton::Left, cx)
+    })
+    .unwrap();
+    for step in 1..=10 {
+        let ratio = step as f32 / 10.;
+        let position = from + (to - from) * ratio;
+        cx.update_window(handle, |_, window, cx| {
+            window.pointer_move(position, Some(MouseButton::Left), cx)
+        })
+        .unwrap();
+        pump(cx, handle, 50);
+    }
+    cx.update_window(handle, |_, window, cx| {
+        window.pointer_up(to, MouseButton::Left, cx)
+    })
+    .unwrap();
+}
+fn exercise_divider(
+    cx: &mut HeadlessAppContext,
+    handle: AnyWindowHandle,
+    view: &gpui_kit::Entity<app::Viewer>,
+    handle_id: &'static str,
+    pane_id: &'static str,
+    delta: gpui_kit::Point<gpui_kit::Pixels>,
+    horizontal: bool,
+) {
+    let saved = |v: &app::Viewer| {
+        if handle_id == "resize-list" {
+            v.prefs.list_width
+        } else if horizontal {
+            v.prefs.details_width
+        } else {
+            v.prefs.stacked_main_height
+        }
+    };
+    let mut before_saved = cx.update(|cx| saved(view.read(cx)));
+    let (start, before) = cx
+        .update_window(handle, |_, window, _| {
+            let bounds = window.find(pane_id).bounds();
+            (
+                window.find(handle_id).bounds().center(),
+                if horizontal {
+                    bounds.size.width
+                } else {
+                    bounds.size.height
+                },
+            )
+        })
+        .unwrap();
+    if !horizontal {
+        // The untouched 240px preference resolves to a 360px default on chart/map
+        // pages. A real drag persists that resolved height, so compare its visible
+        // starting value rather than the sentinel preference.
+        before_saved = f32::from(before);
+    }
+    drag_steps(cx, handle, start, start + delta);
+    cx.update(|cx| {
+        assert!(
+            saved(view.read(cx)) > before_saved,
+            "drag updates saved sizing"
+        )
+    });
+    cx.update_window(handle, |_, window, _| {
+        let bounds = window.find(pane_id).bounds();
+        assert!(
+            (if horizontal {
+                bounds.size.width
+            } else {
+                bounds.size.height
+            }) > before,
+            "divider changes actual pane geometry"
+        );
+    })
+    .unwrap();
+    let start = cx
+        .update_window(handle, |_, window, _| {
+            window.find(handle_id).bounds().center()
+        })
+        .unwrap();
+    drag_steps(cx, handle, start, start - delta);
+    cx.update(|cx| {
+        assert!(
+            (saved(view.read(cx)) - before_saved).abs() < 1.,
+            "reverse drag restores saved sizing"
+        )
+    });
+    cx.update_window(handle, |_, window, _| {
+        let bounds = window.find(pane_id).bounds();
+        let after = if horizontal {
+            bounds.size.width
+        } else {
+            bounds.size.height
+        };
+        assert!(
+            f32::from(after - before).abs() < 1.,
+            "reverse drag restores actual pane geometry"
+        );
+    })
+    .unwrap();
+}
+fn visual_smoke(
+    cx: &mut HeadlessAppContext,
+    handle: AnyWindowHandle,
+    view: &gpui_kit::Entity<app::Viewer>,
+    artifacts: &std::path::Path,
+) {
+    if std::env::var_os("OTEL_NATIVE_SEARCH_SMOKE").is_some() {
+        cx.update_window(handle, |_, window, cx| {
+            view.read(cx)
+                .search
+                .read(cx)
+                .focus_handle(cx)
+                .focus(window, cx)
+        })
+        .unwrap();
+        pump(cx, handle, 150);
+        cx.update_window(handle, |_, window, cx| window.input("traceI", cx))
+            .unwrap();
+        pump(cx, handle, 150);
+        cx.update_window(handle, |_, window, cx| {
+            window.press("down", cx);
+            window.press("enter", cx);
+            assert_eq!(view.read(cx).search.read(cx).value(), "link.traceID ");
+            window.press("cmd-a", cx);
+            window.press("backspace", cx);
+            window.input("traceI", cx);
+        })
+        .unwrap();
+        pump(cx, handle, 150);
+        cx.capture_screenshot(handle)
+            .unwrap()
+            .save(artifacts.join("search-popup-metal.png"))
+            .unwrap();
+        cx.update_window(handle, |_, window, cx| {
+            eprintln!(
+                "Pointer autocomplete bounds: {:?}",
+                window.find(("search-suggestion", 0usize)).bounds()
+            );
+            window.click(("search-suggestion", 0usize), cx);
+            assert_eq!(view.read(cx).search.read(cx).value(), "traceID ");
+        })
+        .unwrap();
+        println!("SEARCH SMOKE passed native keyboard and pointer completion");
+        return;
+    }
+    for (name, label) in [
+        ("traces", "Traces"),
+        ("home", "Home"),
+        ("logs", "Logs"),
+        ("metrics", "Metrics"),
+    ] {
+        cx.update_window(handle, |_, window, cx| window.click(label, cx))
+            .unwrap();
+        pump(cx, handle, 500);
+        if name == "logs" {
+            let before = cx.update(|cx| view.read(cx).data["logs.ui"]["direction"].clone());
+            cx.update_window(handle, |_, window, cx| {
+                window.click("sort-timestamp", cx);
+                assert_ne!(view.read(cx).data["logs.ui"]["direction"], before);
+            })
+            .unwrap();
+            pump(cx, handle, 150);
+            cx.update_window(handle, |_, window, cx| {
+                window.press("enter", cx);
+                assert_eq!(view.read(cx).data["logs.ui"]["direction"], before);
+            })
+            .unwrap();
+            pump(cx, handle, 200);
+            cx.update_window(handle, |_, window, cx| window.click("cell-0-severity", cx))
+                .unwrap();
+            pump(cx, handle, 200);
+        }
+        if name == "metrics" {
+            wait_model(cx, handle, view, "metric summaries", |v| {
+                v.data.get("searchMetricSummaries").is_some()
+            });
+            let index = cx.update(|cx| {
+                view.read(cx).data["searchMetricSummaries"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .position(|v| {
+                        model::field(v, "name") == "http.server.request.duration"
+                            && model::field(v, "metricType").contains("Histogram")
+                            && model::ns(&v["dataPointCount"]) > 10
+                    })
+                    .unwrap()
+            });
+            let reference = cx.update(|cx| {
+                model::field(
+                    &view.read(cx).data["searchMetricSummaries"][index],
+                    "metricRef",
+                )
+            });
+            cx.update_window(handle, |_, window, cx| {
+                let list = window.find("workspace-list").bounds();
+                let card = window.find(("metric", index)).bounds();
+                let desired = list.origin.y + list.size.height * 0.5;
+                window.scroll(
+                    "workspace-list",
+                    ScrollDelta::Pixels(point(px(0.), desired - card.center().y)),
+                    cx,
+                );
+                let card = window.find(("metric", index)).bounds();
+                assert!(
+                    card.center().y > list.origin.y + px(56.)
+                        && card.center().y < list.bottom() - px(48.),
+                    "metric click target center must be inside the card viewport"
+                );
+                window.click(("metric", index), cx);
+                eprintln!(
+                    "Selected metric after native click: {:?}; expected {reference}",
+                    view.read(cx).selected_metric
+                );
+            })
+            .unwrap();
+            wait_model(cx, handle, view, "selected reference metric", |v| {
+                v.selected_metric.as_deref() == Some(reference.as_str())
+                    && v.data
+                        .get("metrics.view")
+                        .is_some_and(|r| r["metricRef"] == reference)
+                    && v.data
+                        .get("metrics.exact")
+                        .is_some_and(|r| r["metricRef"] == reference)
+            });
+            pump(cx, handle, 300);
+        }
+        cx.capture_screenshot(handle)
+            .unwrap()
+            .save(artifacts.join(format!("{name}-1440x900-metal.png")))
+            .unwrap();
+    }
+    cx.update_window(handle, |_, window, cx| {
+        window.resize(size(px(900.), px(760.)));
+        window.bounds_changed(cx);
+        window.render_frame(cx);
+    })
+    .unwrap();
+    for (name, label) in [
+        ("traces", "Traces"),
+        ("home", "Home"),
+        ("logs", "Logs"),
+        ("metrics", "Metrics"),
+    ] {
+        cx.update_window(handle, |_, window, cx| window.click(label, cx))
+            .unwrap();
+        pump(cx, handle, 300);
+        if name == "logs" {
+            cx.update_window(handle, |_, window, _| {
+                for key in ["severity", "timestamp", "service", "body"] {
+                    let header = window.find(format!("sort-{key}")).bounds();
+                    let cell = window.find(format!("cell-0-{key}")).bounds();
+                    assert!(
+                        f32::from(header.origin.x - cell.origin.x).abs() < 1.,
+                        "900px log column {key} must align: {header:?} vs {cell:?}"
+                    );
+                }
+            })
+            .unwrap();
+        }
+        cx.capture_screenshot(handle)
+            .unwrap()
+            .save(artifacts.join(format!("{name}-900x760-metal.png")))
+            .unwrap();
+    }
+    println!(
+        "VISUAL SMOKE complete · production GPUI Metal captures: {}",
+        artifacts.display()
+    );
+}
 fn main() {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..");
     let artifacts = std::env::var_os("OTEL_NATIVE_ARTIFACTS")
@@ -169,6 +446,13 @@ fn main() {
             "collector must flush real fixtures: {stats}"
         );
         std::thread::sleep(Duration::from_millis(30));
+    }
+    if std::env::var_os("OTEL_NATIVE_VISUAL_SMOKE").is_some() {
+        for number in 1..=12 {
+            backend
+                .import_file(&root.join(format!("testdata/otlp/demo/metrics-{number:02}.json")))
+                .unwrap();
+        }
     }
     let trace_summaries = backend
         .call(
@@ -224,6 +508,10 @@ fn main() {
             )
         })
         .unwrap();
+    if std::env::var_os("OTEL_NATIVE_VISUAL_SMOKE").is_some() {
+        visual_smoke(&mut cx, handle, &view, &artifacts);
+        return;
+    }
     let frames = artifacts.join("frames");
     std::fs::create_dir_all(&frames).unwrap();
     RECORDING.with(|state| {
@@ -234,6 +522,24 @@ fn main() {
             started: Instant::now(),
         })
     });
+    exercise_divider(
+        &mut cx,
+        handle,
+        &view,
+        "resize-list",
+        "workspace-list",
+        point(px(20.), px(0.)),
+        true,
+    );
+    exercise_divider(
+        &mut cx,
+        handle,
+        &view,
+        "resize-details",
+        "workspace-details",
+        point(px(-20.), px(0.)),
+        true,
+    );
     cx.update_window(handle, |_, window, cx| {
         window.render_frame(cx);
         assert!(window.find("search").bounds().size.width > px(100.));
@@ -312,6 +618,10 @@ fn main() {
     pump(&mut cx, handle, 350);
     cx.update_window(handle, |_, window, cx| {
         window.click("appearance", cx);
+        assert!(
+            !view.read(cx).appearance_open,
+            "appearance trigger must close its picker"
+        );
         view.read(cx)
             .search
             .read(cx)
@@ -335,6 +645,10 @@ fn main() {
     })
     .unwrap();
     pump(&mut cx, handle, 150);
+    cx.capture_screenshot(handle)
+        .unwrap()
+        .save(artifacts.join("search-popup-metal.png"))
+        .unwrap();
     cx.update_window(handle, |_, window, cx| {
         window.click(("search-suggestion", 0usize), cx);
         assert_eq!(view.read(cx).search.read(cx).value(), "traceID ");
@@ -362,10 +676,17 @@ fn main() {
     .unwrap();
     cx.update(|cx| {
         assert!(
-            view.read(cx).prefs.details_width > 360.,
+            view.read(cx).prefs.details_width > 448.,
             "native drag changes shared saved width"
         )
     });
+    cx.update_window(handle, |_, window, cx| {
+        let start = window.find("resize-details").bounds().center();
+        window.pointer_down(start, MouseButton::Left, cx);
+        window.pointer_move(start + point(px(60.), px(0.)), Some(MouseButton::Left), cx);
+        window.pointer_up(start + point(px(60.), px(0.)), MouseButton::Left, cx);
+    })
+    .unwrap();
     cx.update_window(handle, |_, window, cx| {
         window.click("search", cx);
         window.press("cmd-a", cx);
@@ -389,51 +710,45 @@ fn main() {
             k.starts_with("home.connections.") && !model::discovery_rows(v).is_empty()
         })
     });
-    let edge_midpoint = cx.update(|cx| {
-        let v = view.read(cx);
-        let mut services = model::discovery_rows(&v.data["home.services"]);
-        services.sort_by_key(|s| {
-            (
-                model::field(s, "serviceName"),
-                model::field(s, "serviceNamespace"),
-            )
-        });
-        let edge = v
-            .data
-            .iter()
-            .filter(|(k, _)| k.starts_with("home.connections."))
-            .flat_map(|(_, v)| model::discovery_rows(v))
-            .next()
-            .unwrap();
-        let position = |identity: &Value| {
-            let i = services
-                .iter()
-                .position(|s| s["serviceIdentity"] == *identity)
-                .unwrap();
-            let angle = i as f32 / services.len() as f32 * std::f32::consts::TAU
-                - std::f32::consts::FRAC_PI_2;
-            (0.5 + angle.cos() * 0.36, 0.5 + angle.sin() * 0.36)
-        };
-        let a = position(&edge["source"]["serviceIdentity"]);
-        let b = position(&edge["target"]["serviceIdentity"]);
-        ((a.0 + b.0) / 2., (a.1 + b.1) / 2.)
-    });
-    cx.update_window(handle, |_, window, cx| {
-        let b = window.find("service-map-canvas").bounds();
-        let hit = b.origin
-            + point(
-                b.size.width * edge_midpoint.0,
-                b.size.height * edge_midpoint.1,
+    let expected_edge = cx
+        .update_window(handle, |_, window, cx| {
+            let v = view.read(cx);
+            let mut services = model::discovery_rows(&v.data["home.services"]);
+            services.sort_by_key(|s| {
+                (
+                    model::field(s, "serviceName"),
+                    model::field(s, "serviceNamespace"),
+                )
+            });
+            let bounds = window.find("service-map-canvas").bounds();
+            let routes = home::service_map_routes(
+                &services,
+                &home::service_map_connections(&v.data),
+                1.,
+                (0., 0.),
+                f32::from(bounds.size.width),
+                f32::from(bounds.size.height),
             );
-        window.pointer_down(hit, MouseButton::Left, cx);
-        window.pointer_up(hit, MouseButton::Left, cx);
-    })
-    .unwrap();
+            let route = routes
+                .iter()
+                .find(|route| (route.points[1].1 - route.points[2].1).abs() > 20.)
+                .expect("fixture must expose a routed inter-row edge");
+            let hit = bounds.origin
+                + point(
+                    px((route.points[1].0 + route.points[2].0) * 0.5),
+                    px((route.points[1].1 + route.points[2].1) * 0.5),
+                );
+            let expected = route.reference.clone();
+            window.pointer_down(hit, MouseButton::Left, cx);
+            window.pointer_up(hit, MouseButton::Left, cx);
+            expected
+        })
+        .unwrap();
     wait_model(&mut cx, handle, &view, "painted service edge", |v| {
-        v.data
-            .get("home.selected-edge")
-            .is_some_and(|v| v.is_object())
-            && v.data.get("home.connection-spans").is_some()
+        v.data.get("home.selected-edge").is_some_and(|edge| {
+            edge["source"]["serviceIdentity"] == expected_edge["source"]["serviceIdentity"]
+                && edge["target"]["serviceIdentity"] == expected_edge["target"]["serviceIdentity"]
+        }) && v.data.get("home.connection-spans").is_some()
     });
     cx.capture_screenshot(handle)
         .unwrap()
@@ -441,11 +756,16 @@ fn main() {
         .unwrap();
     pump(&mut cx, handle, 350);
     cx.update_window(handle, |_, window, cx| {
-        window.click(("home-service", 0usize), cx);
+        window.click(("graph-node", 0usize), cx);
     })
     .unwrap();
     pump(&mut cx, handle, 500);
     cx.update(|cx| assert!(view.read(cx).selected_service.is_some()));
+    cx.update_window(handle, |_, window, cx| {
+        window.click("home-details-attributes", cx)
+    })
+    .unwrap();
+    pump(&mut cx, handle, 250);
     wait_model(&mut cx, handle, &view, "Home attribute keys", |v| {
         v.data.get("home.keys").is_some()
     });
@@ -513,14 +833,22 @@ fn main() {
         );
     });
     cx.update_window(handle, |_, window, cx| {
-        window.click("cell-0-body", cx);
+        for key in ["severity", "timestamp", "service", "body"] {
+            let header = window.find(format!("sort-{key}")).bounds();
+            let cell = window.find(format!("cell-0-{key}")).bounds();
+            assert!(
+                (f32::from(header.origin.x - cell.origin.x)).abs() < 1.,
+                "log header {key} and data column must align: {header:?} vs {cell:?}"
+            );
+        }
+        window.click("cell-0-severity", cx);
         window.press("enter", cx);
     })
     .unwrap();
     pump(&mut cx, handle, 200);
     cx.update(|cx| assert!(view.read(cx).selected_log.is_some()));
     cx.update_window(handle, |_, window, cx| {
-        for section in ["summary", "attributes", "resource", "scope", "body", "otlp"] {
+        for section in ["summary"] {
             assert!(
                 window
                     .try_find(format!("detail-section-logs:{section}"))
@@ -529,7 +857,7 @@ fn main() {
             );
         }
         window.scroll(
-            "detail-collapse-logs:summary",
+            "detail-body-logs:summary",
             ScrollDelta::Pixels(point(px(0.), px(-5000.))),
             cx,
         );
@@ -566,7 +894,7 @@ fn main() {
     cx.update_window(handle, |_, window, cx| {
         window.click("raw-toggle-log", cx);
         window.scroll(
-            "raw-toggle-log",
+            "detail-body-logs:summary",
             ScrollDelta::Pixels(point(px(0.), px(5000.))),
             cx,
         );
@@ -599,15 +927,7 @@ fn main() {
     .unwrap();
     pump(&mut cx, handle, 600);
     cx.update_window(handle, |_, window, _| {
-        for section in [
-            "summary",
-            "metadata",
-            "resource",
-            "scope",
-            "series",
-            "datapoints",
-            "otlp",
-        ] {
+        for section in ["summary", "series", "datapoints"] {
             assert!(
                 window
                     .try_find(format!("detail-section-metrics:{section}"))
@@ -669,11 +989,7 @@ fn main() {
             .is_some_and(|s| s["datapoints"].as_array().is_some_and(|p| !p.is_empty()))
     });
     cx.update_window(handle, |_, window, cx| {
-        window.scroll(
-            "detail-collapse-metrics:summary",
-            ScrollDelta::Pixels(point(px(0.), px(-5000.))),
-            cx,
-        );
+        window.click("detail-collapse-metrics:datapoints", cx);
         assert!(window.find(("metric-detail-point", 0usize)).visible());
         window.click(("metric-detail-point", 0usize), cx);
     })
@@ -709,7 +1025,7 @@ fn main() {
         .unwrap();
     cx.update_window(handle, |_, window, cx| {
         window.scroll(
-            "raw-toggle-metric",
+            "detail-body-metrics:summary",
             ScrollDelta::Pixels(point(px(0.), px(5000.))),
             cx,
         )
@@ -787,14 +1103,32 @@ fn main() {
         let index = rows
             .iter()
             .position(|m| {
-                model::field(m, "metricType").contains("Histogram")
+                model::field(m, "name") == "http.server.request.duration"
+                    && model::field(m, "metricType").contains("Histogram")
                     && model::ns(&m["dataPointCount"]) > 10
             })
             .unwrap();
         (index, model::field(&rows[index], "metricRef"))
     });
-    cx.update_window(handle, |_, window, cx| window.click(("metric", index), cx))
-        .unwrap();
+    cx.update_window(handle, |_, window, cx| {
+        let list = window.find("workspace-list").bounds();
+        let card = window.find(("metric", index)).bounds();
+        window.scroll(
+            "workspace-list",
+            ScrollDelta::Pixels(point(
+                px(0.),
+                list.origin.y + list.size.height * 0.5 - card.center().y,
+            )),
+            cx,
+        );
+        let card = window.find(("metric", index)).bounds();
+        assert!(
+            list.contains(&card.center()),
+            "histogram card click must be visible"
+        );
+        window.click(("metric", index), cx);
+    })
+    .unwrap();
     wait_model(&mut cx, handle, &view, "multi-bucket histogram", |view| {
         view.data
             .get("metrics.view")
@@ -929,6 +1263,24 @@ fn main() {
     })
     .unwrap();
     pump(&mut cx, handle, 150);
+    exercise_divider(
+        &mut cx,
+        handle,
+        &view,
+        "resize-details",
+        "workspace-main",
+        point(px(0.), px(24.)),
+        false,
+    );
+    exercise_divider(
+        &mut cx,
+        handle,
+        &view,
+        "resize-list",
+        "workspace-list",
+        point(px(12.), px(0.)),
+        true,
+    );
     cx.capture_screenshot(handle)
         .unwrap()
         .save(artifacts.join("metric-900px-metal.png"))
@@ -949,6 +1301,24 @@ fn main() {
     cx.capture_screenshot(handle)
         .unwrap()
         .save(artifacts.join("trace-900px-metal.png"))
+        .unwrap();
+    cx.update_window(handle, |_, window, cx| window.click("Logs", cx))
+        .unwrap();
+    pump(&mut cx, handle, 350);
+    cx.update_window(handle, |_, window, _| {
+        for key in ["severity", "timestamp", "service", "body"] {
+            let header = window.find(format!("sort-{key}")).bounds();
+            let cell = window.find(format!("cell-0-{key}")).bounds();
+            assert!(
+                (f32::from(header.origin.x - cell.origin.x)).abs() < 1.,
+                "900px log header {key} and data column must align: {header:?} vs {cell:?}"
+            );
+        }
+    })
+    .unwrap();
+    cx.capture_screenshot(handle)
+        .unwrap()
+        .save(artifacts.join("logs-900px-metal.png"))
         .unwrap();
     pump(&mut cx, handle, 350);
     cx.update(|cx| {

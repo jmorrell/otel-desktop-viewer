@@ -57,10 +57,21 @@ pub(crate) fn palette(dark: bool) -> Palette {
     });
     let season =
         ["haru", "natsu", "aki", "fuyu"][SEASON.load(std::sync::atomic::Ordering::Relaxed) % 4];
-    let c = &themes[format!("madoromi-{season}-{}", if dark { "yoru" } else { "hiru" })]["colors"];
+    static INTERFACE: std::sync::OnceLock<serde_json::Value> = std::sync::OnceLock::new();
+    let interface = INTERFACE.get_or_init(|| {
+        serde_json::from_str(include_str!("../assets/interface-palette.json"))
+            .expect("bundled interface palette")
+    });
+    let name = format!("madoromi-{season}-{}", if dark { "yoru" } else { "hiru" });
+    let c = &themes[&name]["colors"];
+    let override_colors = &interface[&name]["colors"];
     let get = |key: &str| {
         u32::from_str_radix(
-            c[key].as_str().unwrap_or("#000000").trim_start_matches('#'),
+            override_colors[key]
+                .as_str()
+                .or_else(|| c[key].as_str())
+                .unwrap_or("#000000")
+                .trim_start_matches('#'),
             16,
         )
         .unwrap_or(0)
@@ -71,11 +82,15 @@ pub(crate) fn palette(dark: bool) -> Palette {
         chrome: get("chrome"),
         text: get("text"),
         subtle: get("subtle"),
-        accent: readable_ink(
-            ink_shades(INK.load(std::sync::atomic::Ordering::Relaxed))[1],
-            get("canvas"),
-            dark,
-        ),
+        accent: if INK.load(std::sync::atomic::Ordering::Relaxed) == usize::MAX {
+            get("primary")
+        } else {
+            readable_ink(
+                ink_shades(INK.load(std::sync::atomic::Ordering::Relaxed))[1],
+                get("canvas"),
+                dark,
+            )
+        },
         selection: get("highlightMedium"),
         error: get("error"),
     }
@@ -100,6 +115,14 @@ pub(crate) fn apply(dark: bool, cx: &mut App) {
         theme.font_family = "Atkinson Hyperlegible Next".into();
         theme.background = color(p.canvas);
         theme.foreground = color(p.text);
+        theme.secondary_foreground = color(p.text);
+        theme.secondary = color(p.panel);
+        theme.secondary_hover = color(p.selection);
+        theme.secondary_active = color(p.selection);
+        theme.button_secondary_hover = color(p.selection);
+        theme.button_secondary_active = color(p.selection);
+        theme.button_secondary_foreground = color(p.text);
+        theme.primary = color(p.accent);
         theme.border = color(p.chrome);
         theme.button = color(p.panel);
         theme.button_foreground = color(p.text);
@@ -115,23 +138,64 @@ pub(crate) fn apply(dark: bool, cx: &mut App) {
     });
 }
 
-pub(crate) fn service_color(identity: &str, dark: bool) -> u32 {
-    static INKS: std::sync::OnceLock<serde_json::Value> = std::sync::OnceLock::new();
-    let inks = INKS.get_or_init(|| {
-        serde_json::from_str(include_str!("../assets/graph-inks.json")).expect("bundled graph inks")
+/// Start from the web viewer's exact identity hash and shared bright-ink ranking.
+/// The automatic colour stays stable across seasons and Day/Night.
+pub(crate) fn service_color(identity: &str, _dark: bool) -> u32 {
+    static RANKING: std::sync::OnceLock<Vec<u32>> = std::sync::OnceLock::new();
+    let colors = RANKING.get_or_init(|| {
+        let ranking: serde_json::Value =
+            serde_json::from_str(include_str!("../assets/bright-ink-slots.json"))
+                .expect("bundled bright ink ranking");
+        ranking["slots"]
+            .as_array()
+            .expect("ink slots")
+            .iter()
+            .map(|slot| {
+                let (ink, shade) = slot
+                    .as_str()
+                    .expect("ink id")
+                    .rsplit_once(':')
+                    .expect("ink shade");
+                let shade: usize = shade.parse().expect("shade number");
+                let hex = ink_catalogue()["inks"][ink][shade - 1]
+                    .as_str()
+                    .expect("graph color");
+                u32::from_str_radix(hex.trim_start_matches('#'), 16).expect("graph color hex")
+            })
+            .collect()
     });
-    let hash = identity.bytes().fold(0xcbf29ce484222325u64, |hash, byte| {
-        (hash ^ byte as u64).wrapping_mul(0x100000001b3)
+    colors[color_identity_hash(identity) as usize % colors.len()]
+}
+fn color_identity_hash(identity: &str) -> u32 {
+    // JavaScript charCodeAt traverses UTF-16 code units, including surrogate pairs.
+    let mut hash = identity.encode_utf16().fold(2166136261u32, |hash, ch| {
+        (hash ^ u32::from(ch)).wrapping_mul(16777619)
     });
-    let map = inks["inks"].as_object().expect("ink catalogue");
-    let (_, shades) = map
-        .iter()
-        .nth(hash as usize % map.len())
-        .expect("graph ink");
-    let shade = shades[if dark { 4 } else { 1 }]
-        .as_str()
-        .unwrap_or("#888888");
-    u32::from_str_radix(shade.trim_start_matches('#'), 16).unwrap_or(0x888888)
+    hash ^= hash >> 16;
+    hash = hash.wrapping_mul(0x85ebca6b);
+    hash ^= hash >> 13;
+    hash = hash.wrapping_mul(0xc2b2ae35);
+    hash ^ (hash >> 16)
+}
+
+#[cfg(test)]
+mod identity_tests {
+    #[test]
+    fn matches_web_identity_hash_for_ascii_and_surrogate_pairs() {
+        for (identity, expected) in [
+            ("api-gateway", 3115499377),
+            ("checkout", 1259066387),
+            ("payments", 340755266),
+            ("🚀 telemetry", 1153140253),
+            ("", 2872998923),
+        ] {
+            assert_eq!(super::color_identity_hash(identity), expected);
+            assert_eq!(
+                super::service_color(identity, false),
+                super::service_color(identity, true)
+            );
+        }
+    }
 }
 
 fn readable_ink(mut ink: u32, background: u32, dark: bool) -> u32 {

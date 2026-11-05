@@ -1,11 +1,12 @@
 use crate::{
     app::{Page, Viewer},
-    metric_chart::{ChartData, histogram_bins},
+    metric_chart::{ChartData, CountScale, histogram_bins},
     model::*,
     theme::{color, palette, service_color},
     widgets,
 };
-use gpui_kit::{component::button::Button, prelude::FluentBuilder, *};
+use gpui_kit::component::Selectable;
+use gpui_kit::{prelude::FluentBuilder, *};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
@@ -29,7 +30,7 @@ pub struct MetricPreferences {
 impl Default for MetricPreferences {
     fn default() -> Self {
         Self {
-            sort: 0,
+            sort: 13,
             aggregate: true,
             quantiles: true,
             hidden_quantiles: Default::default(),
@@ -195,7 +196,7 @@ impl Viewer {
                 }
             }
         }
-        let mut shell = div().flex().size_full().min_w_0().overflow_hidden().gap_2();
+        let mut list_pane = None;
         if self.prefs.list_open {
             let mut list = div()
                 .id("metric-list")
@@ -206,7 +207,7 @@ impl Viewer {
                 .h_full()
                 .flex()
                 .flex_col()
-                .bg(color(p.panel))
+                .bg(color(p.canvas))
                 .rounded_lg();
             let sort_label = [
                 "Name",
@@ -222,9 +223,15 @@ impl Viewer {
                     .flex()
                     .items_center()
                     .justify_between()
+                    .h(px(48.))
+                    .flex_shrink_0()
+                    .px_1()
+                    .mb_4()
+                    .rounded_lg()
+                    .bg(color(p.panel))
                     .child(widgets::heading("Metrics", p))
                     .child(
-                        Button::new("metric-sort")
+                        widgets::button("metric-sort")
                             .label(format!(
                                 "{sort_label} {}",
                                 if self.metrics.prefs.sort % 2 == 0 {
@@ -279,22 +286,86 @@ impl Viewer {
                         }))
                         .min_w_0()
                         .overflow_hidden()
-                        .p_3()
-                        .m_2()
-                        .rounded_md()
+                        .px_4()
+                        .py_3()
+                        .mb_2()
+                        .rounded_lg()
                         .bg(color(if selected { p.selection } else { p.canvas }))
                         .cursor_pointer()
-                        .child(field(metric, "name"))
-                        .child(div().text_xs().text_color(color(p.subtle)).child(format!(
-                            "{} · {}",
-                            field(metric, "metricType"),
-                            field(metric, "serviceName")
-                        )))
-                        .child(div().text_xs().text_color(color(p.subtle)).child(format!(
-                            "{} series · {} points",
-                            field(metric, "seriesCount"),
-                            field(metric, "dataPointCount")
-                        )))
+                        .child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap_2()
+                                .child(
+                                    div()
+                                        .flex_1()
+                                        .min_w_0()
+                                        .overflow_hidden()
+                                        .text_ellipsis()
+                                        .text_size(px(17.))
+                                        .child(field(metric, "name")),
+                                )
+                                .child(div().flex_shrink_0().text_size(px(13.)).child(format!(
+                                    "[{} series | {} pts]",
+                                    field(metric, "seriesCount"),
+                                    field(metric, "dataPointCount")
+                                ))),
+                        )
+                        .child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap_2()
+                                .mt_1()
+                                .text_size(px(14.))
+                                .child(div().size(px(8.)).rounded_full().bg(color(service_color(
+                                    &field(metric, "serviceName"),
+                                    self.prefs.dark,
+                                ))))
+                                .child(
+                                    div()
+                                        .flex_1()
+                                        .min_w_0()
+                                        .overflow_hidden()
+                                        .text_ellipsis()
+                                        .child(field(metric, "serviceName")),
+                                )
+                                .child(
+                                    div().text_color(color(p.accent)).child(
+                                        field(metric, "metricType")
+                                            .replace("ExponentialHistogram", "Exp. Histogram"),
+                                    ),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .flex()
+                                .justify_between()
+                                .gap_2()
+                                .mt_1()
+                                .text_size(px(13.))
+                                .text_color(color(p.subtle))
+                                .child(div().flex_shrink_0().child(format!(
+                                    "Last seen:  {}",
+                                    metric_relative_time(ns(&metric["lastSeen"]))
+                                )))
+                                .when(!metric["lastValue"].is_null(), |row| {
+                                    row.child(
+                                        div()
+                                            .flex_1()
+                                            .min_w_0()
+                                            .overflow_hidden()
+                                            .text_ellipsis()
+                                            .text_right()
+                                            .child(format!(
+                                                "Last value: {} {}",
+                                                metric_card_value(&metric["lastValue"]),
+                                                field(metric, "unit")
+                                            )),
+                                    )
+                                }),
+                        )
                         .on_click(
                             cx.listener(move |this, _, _, cx| this.select_metric(id.clone(), cx)),
                         ),
@@ -309,25 +380,29 @@ impl Viewer {
                     .flex()
                     .justify_between()
                     .p_2()
-                    .child(Button::new("metrics-prev").label("‹").on_click(cx.listener(
-                        |this, _, _, cx| {
-                            this.metrics_offset =
-                                this.metrics_offset.saturating_sub(this.page_size);
-                            cx.notify();
-                        },
-                    )))
+                    .child(
+                        widgets::button("metrics-prev")
+                            .label("‹")
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.metrics_offset =
+                                    this.metrics_offset.saturating_sub(this.page_size);
+                                cx.notify();
+                            })),
+                    )
                     .child(format!(
                         "{} / {total}",
                         (self.metrics_offset + 1).min(total)
                     ))
-                    .child(Button::new("metrics-next").label("›").on_click(cx.listener(
-                        move |this, _, _, cx| {
-                            if this.metrics_offset + this.page_size < total {
-                                this.metrics_offset += this.page_size;
-                                cx.notify();
-                            }
-                        },
-                    ))),
+                    .child(
+                        widgets::button("metrics-next")
+                            .label("›")
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                if this.metrics_offset + this.page_size < total {
+                                    this.metrics_offset += this.page_size;
+                                    cx.notify();
+                                }
+                            })),
+                    ),
             );
             if self.metrics.confirm_clear {
                 list = list.child(
@@ -336,7 +411,7 @@ impl Viewer {
                         .flex_wrap()
                         .gap_1()
                         .child(
-                            Button::new("confirm-clear-metrics")
+                            widgets::button("confirm-clear-metrics")
                                 .label("Confirm delete all metrics")
                                 .on_click(cx.listener(|this, _, _, cx| {
                                     this.rpc_key("metrics.deleted", "clearMetrics", json!([]), cx);
@@ -348,7 +423,7 @@ impl Viewer {
                                 })),
                         )
                         .child(
-                            Button::new("cancel-clear-metrics")
+                            widgets::button("cancel-clear-metrics")
                                 .label("Cancel")
                                 .on_click(cx.listener(|this, _, _, cx| {
                                     this.metrics.confirm_clear = false;
@@ -357,14 +432,16 @@ impl Viewer {
                         ),
                 );
             } else {
-                list = list.child(Button::new("clear-metrics").label("Delete all…").on_click(
-                    cx.listener(|this, _, _, cx| {
-                        this.metrics.confirm_clear = true;
-                        cx.notify();
-                    }),
-                ));
+                list = list.child(
+                    widgets::button("clear-metrics")
+                        .label("Delete all…")
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.metrics.confirm_clear = true;
+                            cx.notify();
+                        })),
+                );
             }
-            shell = shell.child(list);
+            list_pane = Some(list.into_any_element());
         }
         let mut view = self
             .data
@@ -419,75 +496,70 @@ impl Viewer {
                 p,
             ));
         } else {
-            main = main.child(
-                div()
-                    .flex()
-                    .justify_between()
-                    .items_center()
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .overflow_hidden()
-                            .child(widgets::heading(
-                                format!("{} ({})", field(&view, "name"), field(&view, "unit")),
-                                p,
-                            )),
+            let deletion = div()
+                .flex()
+                .gap_1()
+                .when(self.metrics.confirm_delete, |row| {
+                    row.child(
+                        widgets::button("cancel-delete-metric")
+                            .label("Cancel")
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.metrics.confirm_delete = false;
+                                cx.notify();
+                            })),
                     )
-                    .child(
-                        div()
-                            .flex()
-                            .gap_1()
-                            .when(self.metrics.confirm_delete, |row| {
-                                row.child(
-                                    Button::new("cancel-delete-metric")
-                                        .label("Cancel")
-                                        .on_click(cx.listener(|this, _, _, cx| {
-                                            this.metrics.confirm_delete = false;
-                                            cx.notify();
-                                        })),
-                                )
-                            })
-                            .child(
-                                Button::new("delete-metric")
-                                    .label(if self.metrics.confirm_delete {
-                                        "Confirm delete"
-                                    } else {
-                                        "Delete…"
-                                    })
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        if this.metrics.confirm_delete {
-                                            if let Some(id) = this.selected_metric.clone() {
-                                                this.rpc_key(
-                                                    "metrics.deleted",
-                                                    "deleteMetric",
-                                                    json!({"metricRef":id}),
-                                                    cx,
-                                                );
-                                                this.selected_metric = None;
-                                                this.data.remove("metrics.view");
-                                                this.metrics.confirm_delete = false;
-                                                this.metrics_offset = 0;
-                                                cx.notify();
-                                            }
-                                        } else {
-                                            this.metrics.confirm_delete = true;
-                                            cx.notify();
-                                        }
-                                    })),
-                            ),
-                    ),
-            );
-            let mut controls = div().flex().flex_wrap().gap_1().px_3();
+                })
+                .child(
+                    widgets::button("delete-metric")
+                        .label(if self.metrics.confirm_delete {
+                            "Confirm delete"
+                        } else {
+                            "Delete…"
+                        })
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            if this.metrics.confirm_delete {
+                                if let Some(id) = this.selected_metric.clone() {
+                                    this.rpc_key(
+                                        "metrics.deleted",
+                                        "deleteMetric",
+                                        json!({"metricRef":id}),
+                                        cx,
+                                    );
+                                    this.selected_metric = None;
+                                    this.data.remove("metrics.view");
+                                    this.metrics.confirm_delete = false;
+                                    this.metrics_offset = 0;
+                                    cx.notify();
+                                }
+                            } else {
+                                this.metrics.confirm_delete = true;
+                                cx.notify();
+                            }
+                        })),
+                );
+            let mut controls = div()
+                .flex()
+                .items_center()
+                .h(px(48.))
+                .flex_shrink_0()
+                .gap_1()
+                .px_2()
+                .rounded_lg()
+                .bg(color(p.panel))
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .text_ellipsis()
+                        .child(field(&view, "name")),
+                );
             if histogram {
                 for (heatmap, label) in [(true, "Heatmap"), (false, "Histogram")] {
                     controls = controls.child(
-                        Button::new(label)
-                            .label(if self.metrics.prefs.heatmap == heatmap {
-                                format!("• {label}")
-                            } else {
-                                label.into()
-                            })
+                        widgets::button(label)
+                            .label(label)
+                            .toggled(self.metrics.prefs.heatmap == heatmap)
+                            .selected(self.metrics.prefs.heatmap == heatmap)
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 this.metrics.prefs.heatmap = heatmap;
                                 this.save_metric_preferences();
@@ -496,12 +568,10 @@ impl Viewer {
                     );
                 }
                 controls = controls.child(
-                    Button::new("quantiles")
-                        .label(if self.metrics.prefs.quantiles {
-                            "Quantiles ✓"
-                        } else {
-                            "Quantiles"
-                        })
+                    widgets::button("quantiles")
+                        .label("Percentiles")
+                        .toggled(self.metrics.prefs.quantiles)
+                        .selected(self.metrics.prefs.quantiles)
                         .on_click(cx.listener(|this, _, _, cx| {
                             this.metrics.prefs.quantiles = !this.metrics.prefs.quantiles;
                             this.save_metric_preferences();
@@ -533,12 +603,10 @@ impl Viewer {
                             self.metrics.prefs.mode == 3
                         };
                         controls = controls.child(
-                            Button::new(label)
-                                .label(if active {
-                                    format!("• {label}")
-                                } else {
-                                    label.into()
-                                })
+                            widgets::button(label)
+                                .label(label)
+                                .toggled(active)
+                                .selected(active)
                                 .on_click(cx.listener(move |this, _, _, cx| {
                                     this.metrics.prefs.mode = mode;
                                     this.save_metric_preferences();
@@ -555,8 +623,10 @@ impl Viewer {
                         let checked =
                             self.metrics.prefs.mode == mode || self.metrics.prefs.mode == 4;
                         controls = controls.child(
-                            Button::new(label)
-                                .label(format!("{} {label}", if checked { "☑" } else { "☐" }))
+                            widgets::button(label)
+                                .label(label)
+                                .toggled(checked)
+                                .selected(checked)
                                 .on_click(cx.listener(move |this, _, _, cx| {
                                     this.metrics.prefs.mode = match (this.metrics.prefs.mode, mode)
                                     {
@@ -573,12 +643,10 @@ impl Viewer {
                     }
                 }
                 controls = controls.child(
-                    Button::new("metric-stats")
-                        .label(if self.metrics.prefs.stats {
-                            "Stats ✓"
-                        } else {
-                            "Stats"
-                        })
+                    widgets::button("metric-stats")
+                        .label("Stats")
+                        .toggled(self.metrics.prefs.stats)
+                        .selected(self.metrics.prefs.stats)
                         .on_click(cx.listener(|this, _, _, cx| {
                             this.metrics.prefs.stats = !this.metrics.prefs.stats;
                             this.save_metric_preferences();
@@ -586,12 +654,10 @@ impl Viewer {
                         })),
                 );
                 controls = controls.child(
-                    Button::new("aggregate")
-                        .label(if self.metrics.prefs.aggregate {
-                            "All series aggregate ✓"
-                        } else {
-                            "All series aggregate"
-                        })
+                    widgets::button("aggregate")
+                        .label("Aggregate")
+                        .toggled(self.metrics.prefs.aggregate)
+                        .selected(self.metrics.prefs.aggregate)
                         .on_click(cx.listener(|this, _, _, cx| {
                             this.metrics.prefs.aggregate = !this.metrics.prefs.aggregate;
                             this.save_metric_preferences();
@@ -607,7 +673,7 @@ impl Viewer {
                     let shade =
                         crate::theme::ink_shades(index)[if self.prefs.dark { 0 } else { 2 }];
                     chooser = chooser.child(
-                        Button::new(("metric-ink", index))
+                        widgets::button(("metric-ink", index))
                             .label(format!("● {name}"))
                             .text_color(color(shade))
                             .on_click(cx.listener(move |this, _, _, cx| {
@@ -619,24 +685,25 @@ impl Viewer {
                     );
                 }
                 let reset = target.clone();
-                chooser =
-                    chooser
-                        .child(
-                            Button::new("metric-ink-default")
-                                .label("Automatic")
-                                .on_click(cx.listener(move |this, _, _, cx| {
-                                    this.metrics.prefs.colors.remove(&reset);
-                                    this.metrics.color_target = None;
-                                    this.save_metric_preferences();
-                                    cx.notify();
-                                })),
-                        )
-                        .child(Button::new("metric-ink-cancel").label("Close").on_click(
-                            cx.listener(|this, _, _, cx| {
+                chooser = chooser
+                    .child(
+                        widgets::button("metric-ink-default")
+                            .label("Automatic")
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.metrics.prefs.colors.remove(&reset);
+                                this.metrics.color_target = None;
+                                this.save_metric_preferences();
+                                cx.notify();
+                            })),
+                    )
+                    .child(
+                        widgets::button("metric-ink-cancel")
+                            .label("Close")
+                            .on_click(cx.listener(|this, _, _, cx| {
                                 this.metrics.color_target = None;
                                 cx.notify();
-                            }),
-                        ));
+                            })),
+                    );
                 main = main.child(chooser);
             }
             let unsafe_temporality = field(&view, "metricType") != "Gauge"
@@ -651,31 +718,51 @@ impl Viewer {
             } else {
                 main = main.child(self.render_metric_chart(&view, cx));
             }
+            main = main.child(div().flex().justify_end().flex_shrink_0().child(deletion));
             if !view["boundsMismatch"].is_null() {
                 main = main.child(widgets::heading(
                     "Some histograms have incompatible bounds and cannot be combined",
                     p,
                 ));
             }
-            let mut rows = div()
-                .id("metric-series")
-                .overflow_y_scroll()
-                .flex_1()
-                .child(
-                    div()
-                        .flex()
-                        .justify_between()
-                        .items_center()
-                        .child(widgets::heading(
-                            format!(
-                                "{} series · {} points",
-                                series.len(),
-                                field(&view, "datapointCount")
-                            ),
-                            p,
-                        ))
-                        .child(Button::new("toggle-series").label("All / None").on_click(
-                            cx.listener(|this, _, _, cx| {
+        }
+        let details = self.prefs.details_open.then(|| {
+            div()
+                .w(px(details_width))
+                .flex_shrink_0()
+                .min_w_0()
+                .overflow_hidden()
+                .h_full()
+                .child(self.render_metric_details(window, cx))
+                .into_any_element()
+        });
+        self.render_workspace(list_pane, main.into_any_element(), details, window)
+    }
+
+    pub fn render_metric_series(&mut self, view: &Value, cx: &mut Context<Self>) -> AnyElement {
+        let p = palette(self.prefs.dark);
+        let series = view["timeseries"].as_array().cloned().unwrap_or_default();
+        let mut rows = div()
+            .id("metric-series")
+            .overflow_y_scroll()
+            .flex_1()
+            .child(
+                div()
+                    .flex()
+                    .justify_between()
+                    .items_center()
+                    .child(widgets::heading(
+                        format!(
+                            "{} series · {} points",
+                            series.len(),
+                            field(&view, "datapointCount")
+                        ),
+                        p,
+                    ))
+                    .child(
+                        widgets::button("toggle-series")
+                            .label("All / None")
+                            .on_click(cx.listener(|this, _, _, cx| {
                                 if this.metrics.visible.is_empty() {
                                     if let Some(series) = this
                                         .data
@@ -692,127 +779,108 @@ impl Viewer {
                                     this.request_metric_view(&id, cx);
                                 }
                                 cx.notify();
-                            }),
-                        )),
-                );
-            for (i, series) in series.iter().enumerate() {
-                let id = field(series, "seriesRef");
-                let selected = self.selected_series.as_ref() == Some(&id);
-                let checked = self.metrics.visible.contains(&id);
-                let toggle = id.clone();
-                let choose = id.clone();
-                let key_choose = id.clone();
-                let row_focus = self
-                    .metrics
-                    .row_focus
-                    .entry(format!("series:{id}"))
-                    .or_insert_with(|| cx.focus_handle())
-                    .clone();
-                let tint = self.metric_color(&id);
-                let label = series["attributes"]
-                    .as_array()
-                    .map(|a| {
-                        a.iter()
-                            .map(|a| format!("{}={}", field(a, "key"), attribute(&a["value"])))
-                            .collect::<Vec<_>>()
-                            .join(" · ")
-                    })
-                    .filter(|s| !s.is_empty())
-                    .unwrap_or_else(|| "(no attributes)".into());
-                let color_id = id.clone();
-                let mut row = div()
-                    .id(("series", i))
-                    .test_support()
-                    .flex()
-                    .items_center()
-                    .gap_2()
-                    .p_2()
-                    .bg(color(if selected { p.selection } else { p.canvas }))
-                    .border_b_1()
-                    .border_color(color(p.chrome))
-                    .child(
-                        Button::new(("visible", i))
-                            .label(if checked { "☑" } else { "☐" })
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                if !this.metrics.visible.remove(&toggle) {
-                                    this.metrics.visible.insert(toggle.clone());
-                                }
-                                if let Some(id) = this.selected_metric.clone() {
-                                    this.request_metric_view(&id, cx);
-                                }
-                                cx.notify();
                             })),
-                    )
-                    .child(
-                        Button::new(("series-color", i))
-                            .label("●")
-                            .text_color(color(tint))
-                            .accessibility_label("Choose series color")
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                this.metrics.color_target = Some(color_id.clone());
-                                cx.notify();
-                            })),
-                    )
-                    .child(
-                        div()
-                            .id(("series-select", i))
-                            .test_support()
-                            .role(Role::Button)
-                            .aria_label(format!("Inspect series {label}"))
-                            .track_focus(&row_focus)
-                            .tab_stop(true)
-                            .on_key_down(cx.listener(move |this, event: &KeyDownEvent, _, cx| {
-                                if ["enter", "space"].contains(&event.keystroke.key.as_str()) {
-                                    this.select_metric_series(key_choose.clone(), cx);
-                                    cx.stop_propagation();
-                                }
-                            }))
-                            .flex_1()
-                            .min_w_0()
-                            .cursor_pointer()
-                            .text_color(color(tint))
-                            .child(
-                                div()
-                                    .w_full()
-                                    .overflow_hidden()
-                                    .text_ellipsis()
-                                    .child(label),
-                            )
-                            .child(div().text_xs().text_color(color(p.subtle)).child(format!(
-                                "{} points · {}",
-                                field(series, "datapointCount"),
-                                service(&series["resource"])
-                            )))
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                this.select_metric_series(choose.clone(), cx)
-                            })),
-                    );
-                let points: Vec<_> = series["sparkline"]
-                    .as_array()
-                    .into_iter()
-                    .flatten()
-                    .filter_map(|p| Some((ns(&p["timestamp"]), number(&p["value"])?)))
-                    .collect();
-                if !points.is_empty() {
-                    row = row.child(sparkline(points, tint).w(px(100.)).h(px(32.)));
-                }
-                rows = rows.child(row);
-            }
-            main = main.child(rows);
-        }
-        shell = shell.child(main);
-        if self.prefs.details_open {
-            shell = shell.child(
-                div()
-                    .w(px(details_width))
-                    .flex_shrink_0()
-                    .min_w_0()
-                    .overflow_hidden()
-                    .h_full()
-                    .child(self.render_metric_details(window, cx)),
+                    ),
             );
+        for (i, series) in series.iter().enumerate() {
+            let id = field(series, "seriesRef");
+            let selected = self.selected_series.as_ref() == Some(&id);
+            let checked = self.metrics.visible.contains(&id);
+            let toggle = id.clone();
+            let choose = id.clone();
+            let key_choose = id.clone();
+            let row_focus = self
+                .metrics
+                .row_focus
+                .entry(format!("series:{id}"))
+                .or_insert_with(|| cx.focus_handle())
+                .clone();
+            let tint = self.metric_color(&id);
+            let label = series["attributes"]
+                .as_array()
+                .map(|a| {
+                    a.iter()
+                        .map(|a| format!("{}={}", field(a, "key"), attribute(&a["value"])))
+                        .collect::<Vec<_>>()
+                        .join(" · ")
+                })
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| "(no attributes)".into());
+            let color_id = id.clone();
+            let mut row = div()
+                .id(("series", i))
+                .test_support()
+                .flex()
+                .items_center()
+                .gap_2()
+                .p_2()
+                .bg(color(if selected { p.selection } else { p.canvas }))
+                .border_b_1()
+                .border_color(color(p.chrome))
+                .child(
+                    widgets::button(("visible", i))
+                        .label(if checked { "☑" } else { "☐" })
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            if !this.metrics.visible.remove(&toggle) {
+                                this.metrics.visible.insert(toggle.clone());
+                            }
+                            if let Some(id) = this.selected_metric.clone() {
+                                this.request_metric_view(&id, cx);
+                            }
+                            cx.notify();
+                        })),
+                )
+                .child(
+                    widgets::button(("series-color", i))
+                        .label("●")
+                        .text_color(color(tint))
+                        .accessibility_label("Choose series color")
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.metrics.color_target = Some(color_id.clone());
+                            cx.notify();
+                        })),
+                )
+                .child(
+                    div()
+                        .id(("series-select", i))
+                        .test_support()
+                        .role(Role::Button)
+                        .aria_label(format!("Inspect series {label}"))
+                        .track_focus(&row_focus)
+                        .tab_stop(true)
+                        .on_key_down(cx.listener(move |this, event: &KeyDownEvent, _, cx| {
+                            if ["enter", "space"].contains(&event.keystroke.key.as_str()) {
+                                this.select_metric_series(key_choose.clone(), cx);
+                                cx.stop_propagation();
+                            }
+                        }))
+                        .flex_1()
+                        .min_w_0()
+                        .cursor_pointer()
+                        .text_color(color(p.text))
+                        .child(
+                            div()
+                                .w_full()
+                                .overflow_hidden()
+                                .text_ellipsis()
+                                .child(label),
+                        )
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.select_metric_series(choose.clone(), cx)
+                        })),
+                );
+            let points: Vec<_> = series["sparkline"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|p| Some((ns(&p["timestamp"]), number(&p["value"])?)))
+                .collect();
+            if !points.is_empty() {
+                row = row.child(sparkline(points, tint).w(px(100.)).h(px(32.)));
+            }
+            rows = rows.child(row);
         }
-        shell.into_any_element()
+        rows.into_any_element()
     }
 
     fn render_metric_chart(&mut self, view: &Value, cx: &mut Context<Self>) -> AnyElement {
@@ -950,6 +1018,18 @@ impl Viewer {
         let bounds = self.metrics.bounds.clone();
         let prepaint = bounds.clone();
         let heatmap = self.metrics.prefs.heatmap;
+        let count_scale = CountScale::new(
+            if heatmap {
+                data.columns
+                    .iter()
+                    .flat_map(|column| column.bins.iter().map(|bin| bin.count))
+                    .collect::<Vec<_>>()
+            } else {
+                bins.iter().map(|bin| bin.count).collect()
+            },
+            self.prefs.dark,
+        );
+        let painted_count_scale = count_scale.clone();
         let focus = self.metrics.focus.clone().unwrap();
         let focus_on_click = focus.clone();
         let hover = self.metrics.hover;
@@ -976,37 +1056,17 @@ impl Viewer {
                 }
                 if histogram && heatmap {
                     for (i, column) in plot.columns.iter().enumerate() {
-                        let x1 = plot.x(column.start);
-                        let x2 = plot.x(column.time);
-                        let fallback = 1. / plot.columns.len().max(1) as f32;
-                        let (x1, x2) = if x1 == x2 {
-                            if plot.columns.len() == 1 {
-                                (0., 1.)
-                            } else {
-                                ((x2 - fallback / 2.).max(0.), (x2 + fallback / 2.).min(1.))
-                            }
-                        } else {
-                            (x1, x2)
-                        };
-                        let width = (x2 - x1).max(0.001);
+                        let (x1, x2) = plot.heat_column_bounds(i);
+                        let width = x2 - x1;
                         for bin in &column.bins {
                             if bin.count <= 0. {
                                 continue;
                             }
-                            let lower = if bin.lower.is_finite() {
-                                bin.lower
-                            } else {
-                                plot.y_min
+                            let Some(row) = plot.heat_row(bin) else {
+                                continue;
                             };
-                            let upper = if bin.upper.is_finite() {
-                                bin.upper
-                            } else {
-                                plot.y_max
-                            };
-                            let y1 = plot.y(upper);
-                            let y2 = plot.y(lower);
-                            let alpha =
-                                (bin.count.ln_1p() / plot.count_max.ln_1p()).clamp(0.08, 1.) as f32;
+                            let y1 = row as f32 / plot.heat_rows.len().max(1) as f32;
+                            let y2 = (row + 1) as f32 / plot.heat_rows.len().max(1) as f32;
                             window.paint_quad(fill(
                                 Bounds {
                                     origin: b.origin + point(b.size.width * x1, b.size.height * y1),
@@ -1015,10 +1075,9 @@ impl Viewer {
                                         (b.size.height * (y2 - y1)).max(px(2.)),
                                     ),
                                 },
-                                color(p.accent).opacity(alpha),
+                                color(painted_count_scale.color(bin.count)),
                             ));
                         }
-                        let _ = i;
                     }
                 } else if histogram {
                     let maximum = bins.iter().map(|b| b.count).fold(1., f64::max);
@@ -1037,7 +1096,7 @@ impl Viewer {
                                     b.size.height * height,
                                 ),
                             },
-                            color(p.accent),
+                            color(painted_count_scale.color(bin.count)),
                         ));
                         if let Some(selected) = painted_contribution_bins.iter().find(|selected| {
                             selected.lower == bin.lower && selected.upper == bin.upper
@@ -1066,27 +1125,19 @@ impl Viewer {
                 }
                 if histogram && heatmap {
                     if let Some(contribution) = &painted_contribution {
-                        let start = plot.x(ns(&contribution["startTime"]));
-                        let end = plot.x(ns(&contribution["timestamp"]));
-                        let (start, end) = if start == end && plot.columns.len() == 1 {
-                            (0., 1.)
-                        } else {
-                            (start, end)
-                        };
+                        let index = plot.heat_column_for_timestamp(ns(&contribution["timestamp"]));
+                        let (start, end) = index
+                            .map(|i| plot.heat_column_bounds(i))
+                            .unwrap_or((0., 0.));
                         for bin in &painted_contribution_bins {
-                            if bin.count <= 0. {
+                            if bin.count <= 0. || index.is_none() {
                                 continue;
                             }
-                            let top = plot.y(if bin.upper.is_finite() {
-                                bin.upper
-                            } else {
-                                plot.y_max
-                            });
-                            let bottom = plot.y(if bin.lower.is_finite() {
-                                bin.lower
-                            } else {
-                                plot.y_min
-                            });
+                            let Some(row) = plot.heat_row(bin) else {
+                                continue;
+                            };
+                            let top = row as f32 / plot.heat_rows.len().max(1) as f32;
+                            let bottom = (row + 1) as f32 / plot.heat_rows.len().max(1) as f32;
                             let rect = Bounds {
                                 origin: b.origin + point(b.size.width * start, b.size.height * top),
                                 size: size(
@@ -1124,14 +1175,56 @@ impl Viewer {
                         }
                     }
                 }
-                if !histogram || heatmap {
+                if histogram && heatmap {
+                    for curve in &plot.curves {
+                        let key = curve.id.strip_prefix('p').unwrap_or(&curve.id);
+                        for (width, tint) in [(3., 0xffffff), (1., curve.color)] {
+                            let mut path = PathBuilder::stroke(px(width));
+                            let mut previous: Option<(usize, f32)> = None;
+                            for (index, column) in plot.columns.iter().enumerate() {
+                                let Some(y) = number(&column.value["quantiles"][key])
+                                    .and_then(|value| plot.heat_y(value, column))
+                                else {
+                                    previous = None;
+                                    continue;
+                                };
+                                let (left, right) = plot.heat_column_bounds(index);
+                                let start =
+                                    b.origin + point(b.size.width * left, b.size.height * y);
+                                let end = b.origin + point(b.size.width * right, b.size.height * y);
+                                if previous.is_some_and(|(last, _)| last + 1 == index) {
+                                    path.line_to(start);
+                                } else {
+                                    path.move_to(start);
+                                }
+                                path.line_to(end);
+                                previous = Some((index, y));
+                            }
+                            if let Ok(path) = path.build() {
+                                window.paint_path(path, color(tint));
+                            }
+                        }
+                    }
+                }
+                if !histogram {
                     for curve in &plot.curves {
                         let mut path = PathBuilder::stroke(px(2.));
                         for (i, point_) in curve.points.iter().enumerate() {
                             let pos = b.origin
                                 + point(
                                     b.size.width * plot.x(point_.time),
-                                    b.size.height * plot.y(point_.value),
+                                    b.size.height
+                                        * if histogram && heatmap {
+                                            plot.columns
+                                                .iter()
+                                                .find(|c| c.time == point_.time)
+                                                .and_then(|column| {
+                                                    plot.heat_y(point_.value, column)
+                                                })
+                                                .unwrap_or_else(|| plot.y(point_.value))
+                                        } else {
+                                            plot.y(point_.value)
+                                        },
                                 );
                             if i == 0 {
                                 path.move_to(pos);
@@ -1197,8 +1290,8 @@ impl Viewer {
             .tab_stop(true)
             .relative()
             .m_3()
-            .h(px(310.))
-            .flex_shrink_0()
+            .flex_1()
+            .min_h(px(100.))
             .flex()
             .flex_col()
             .on_mouse_move(cx.listener(move |this, event: &MouseMoveEvent, _, cx| {
@@ -1268,8 +1361,9 @@ impl Viewer {
                     this.metrics.hover = Some((x, 0.5));
                     this.select_chart_at(&keyboard_data, x, cx);
                 } else if histogram {
-                    if let Some(column) = keyboard_data.columns.get(this.metrics.cursor) {
-                        let x = keyboard_data.x(column.time);
+                    if this.metrics.cursor < keyboard_data.columns.len() {
+                        let (left, right) = keyboard_data.heat_column_bounds(this.metrics.cursor);
+                        let x = (left + right) / 2.;
                         this.metrics.hover = Some((x, 0.5));
                         this.select_chart_at(&keyboard_data, x, cx);
                     }
@@ -1279,13 +1373,78 @@ impl Viewer {
                     .iter()
                     .flat_map(|c| c.points.iter())
                     .nth(this.metrics.cursor);
-                if let Some(point) = point {
+                if let Some(point) = point.filter(|_| !histogram) {
                     let x = keyboard_data.x(point.time);
                     this.metrics.hover = Some((x, keyboard_data.y(point.value)));
                     this.select_chart_at(&keyboard_data, x, cx);
                 }
                 cx.notify();
             }));
+        if histogram {
+            root = root.child(
+                div()
+                    .flex()
+                    .flex_wrap()
+                    .gap_3()
+                    .pb_4()
+                    .text_size(px(13.))
+                    .children(count_scale.bands.iter().map(|(label, tint)| {
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .child(div().size(px(8.)).rounded_sm().bg(color(*tint)))
+                            .child(label.clone())
+                    })),
+            );
+        }
+        let mut bucket_labels = div()
+            .w(px(100.))
+            .flex_shrink_0()
+            .flex()
+            .flex_col()
+            .text_xs()
+            .text_color(color(p.subtle));
+        if histogram && heatmap {
+            // Use the last measured plot height; a conservative first-frame
+            // estimate avoids drawing overlapping labels before prepaint.
+            let plot_height = self
+                .metrics
+                .bounds
+                .lock()
+                .unwrap()
+                .as_ref()
+                .map(|bounds| f32::from(bounds.size.height))
+                .filter(|height| *height > 0.)
+                .unwrap_or(60.);
+            let label_stride =
+                ((data.heat_rows.len() as f32 * 16. / plot_height).ceil() as usize).max(1);
+            for (index, bin) in data.heat_rows.iter().enumerate() {
+                let label = if !bin.lower.is_finite() && !bin.upper.is_finite() {
+                    "all values".into()
+                } else if !bin.lower.is_finite() {
+                    format!("≤{}", bin.upper)
+                } else if !bin.upper.is_finite() {
+                    format!(">{}", bin.lower)
+                } else {
+                    format!("({}, {}]", bin.lower, bin.upper)
+                };
+                bucket_labels = bucket_labels.child(
+                    div()
+                        .flex_1()
+                        .min_h_0()
+                        .flex()
+                        .items_center()
+                        .justify_end()
+                        .pr_2()
+                        .child(if index % label_stride == 0 {
+                            label
+                        } else {
+                            String::new()
+                        }),
+                );
+            }
+        }
         root = root
             .child(
                 div()
@@ -1301,6 +1460,8 @@ impl Viewer {
                                 .map(|b| b.count)
                                 .fold(0., f64::max)
                         )
+                    } else if histogram {
+                        format!("value ({unit})")
                     } else {
                         format!("{:.4} {unit}", data.y_max)
                     })
@@ -1321,26 +1482,34 @@ impl Viewer {
                 div()
                     .flex_1()
                     .min_h_0()
-                    .relative()
-                    .child(chart)
-                    .children(if empty {
-                        Some(
-                            div()
-                                .absolute()
-                                .inset_0()
-                                .flex()
-                                .items_center()
-                                .justify_center()
-                                .text_color(color(p.subtle))
-                                .child(if self.metrics.visible.is_empty() {
-                                    "Select a timeseries below to draw its data"
-                                } else {
-                                    "No observations to chart in this time range"
-                                }),
-                        )
-                    } else {
-                        None
-                    }),
+                    .flex()
+                    .children((histogram && heatmap).then_some(bucket_labels))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .min_h_0()
+                            .relative()
+                            .child(chart)
+                            .children(if empty {
+                                Some(
+                                    div()
+                                        .absolute()
+                                        .inset_0()
+                                        .flex()
+                                        .items_center()
+                                        .justify_center()
+                                        .text_color(color(p.subtle))
+                                        .child(if self.metrics.visible.is_empty() {
+                                            "Select a timeseries in Details to draw its data"
+                                        } else {
+                                            "No observations to chart in this time range"
+                                        }),
+                                )
+                            } else {
+                                None
+                            }),
+                    ),
             )
             .child(
                 div()
@@ -1348,22 +1517,30 @@ impl Viewer {
                     .justify_between()
                     .text_xs()
                     .text_color(color(p.subtle))
-                    .child(if histogram && !heatmap {
-                        histogram_bins_for_hover
-                            .first()
-                            .map(|b| format!("{} {unit}", b.lower))
-                            .unwrap_or_default()
-                    } else {
-                        chart_time(axis.x_min)
-                    })
-                    .child(if histogram && !heatmap {
-                        histogram_bins_for_hover
-                            .last()
-                            .map(|b| format!("{} {unit}", b.upper))
-                            .unwrap_or_default()
-                    } else {
-                        chart_time(axis.x_max)
-                    }),
+                    .when(histogram && heatmap, |row| row.pl(px(100.)))
+                    .children((0..5).map(|i| {
+                        let label = if histogram && !heatmap {
+                            let index = (histogram_bins_for_hover.len().saturating_sub(1) * i) / 4;
+                            histogram_bins_for_hover
+                                .get(index)
+                                .map(|bin| {
+                                    if bin.upper.is_finite() {
+                                        format!("{}", bin.upper)
+                                    } else if bin.lower.is_finite() {
+                                        format!(">{}", bin.lower)
+                                    } else {
+                                        "all".into()
+                                    }
+                                })
+                                .unwrap_or_default()
+                        } else if histogram && heatmap && !axis.columns.is_empty() {
+                            let index = axis.columns.len().saturating_sub(1) * i / 4;
+                            chart_time(axis.columns[index].time)
+                        } else {
+                            chart_time(axis.x_min + (axis.x_max - axis.x_min) * i as i128 / 4)
+                        };
+                        div().child(label)
+                    })),
             );
         let mut legend = div().flex().flex_wrap().gap_3().text_xs();
         for curve in data
@@ -1392,9 +1569,10 @@ impl Viewer {
                     }
                 );
                 legend = legend.child(
-                    Button::new(SharedString::from(format!("quantile-{q}")))
+                    widgets::button(SharedString::from(format!("quantile-{q}")))
                         .label(label)
                         .toggled(self.metrics.prefs.quantiles && enabled)
+                        .selected(self.metrics.prefs.quantiles && enabled)
                         .text_color(color(self.metric_color(q)))
                         .on_click(cx.listener(move |this, _, _, cx| {
                             let enabled = this.metrics.prefs.quantiles
@@ -1444,11 +1622,9 @@ impl Viewer {
                     })
                     .unwrap_or_default()
             } else if histogram {
-                data.nearest_column(x)
+                data.heat_column_at(x)
                     .map(|c| {
-                        let value = data.y_max
-                            - hover.map_or(0.5, |h| h.1) as f64 * (data.y_max - data.y_min);
-                        let bin = c.bins.iter().find(|b| b.lower <= value && value <= b.upper);
+                        let bin = data.heat_bin_at(c, hover.map_or(0.5, |h| h.1));
                         format!(
                             "{} · {} observations{}",
                             format_timestamp(c.time),
@@ -1510,7 +1686,7 @@ impl Viewer {
                         self.data.insert("metrics.bucket".into(), json!({"selection":"Histogram window bucket","lower":bin.lower.to_string(),"upper":bin.upper.to_string(),"count":bin.exact_count,"window":summary}));
                     }
                 }
-            } else if let Some(column) = data.nearest_column(x) {
+            } else if let Some(column) = data.heat_column_at(x) {
                 self.data
                     .insert("metrics.bucket".into(), column.value.clone());
             }
@@ -1576,7 +1752,44 @@ fn sparkline(points: Vec<(i128, f64)>, tint: u32) -> impl Styled + IntoElement {
 
 fn chart_time(time: i128) -> String {
     format_timestamp(time)
-        .split_once(' ')
-        .map(|(_, time)| time.to_owned())
-        .unwrap_or_else(|| format_timestamp(time))
+        .split_whitespace()
+        .nth(1)
+        .and_then(|time| time.get(..8))
+        .unwrap_or("—")
+        .to_owned()
+}
+
+fn metric_relative_time(timestamp: i128) -> String {
+    if timestamp == 0 {
+        return "—".into();
+    }
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let delta = (now as i128)
+        .saturating_sub(timestamp / 1_000_000_000)
+        .max(0);
+    let (n, unit) = if delta < 60 {
+        (delta, "second")
+    } else if delta < 3600 {
+        (delta / 60, "minute")
+    } else if delta < 86400 {
+        (delta / 3600, "hour")
+    } else if delta < 604800 {
+        (delta / 86400, "day")
+    } else {
+        (delta / 604800, "week")
+    };
+    format!("{n} {unit}{} ago", if n == 1 { "" } else { "s" })
+}
+fn metric_card_value(value: &Value) -> String {
+    number(value)
+        .map(|n| {
+            format!("{n:.6}")
+                .trim_end_matches('0')
+                .trim_end_matches('.')
+                .to_owned()
+        })
+        .unwrap_or_else(|| field(&json!({"value":value}), "value"))
 }

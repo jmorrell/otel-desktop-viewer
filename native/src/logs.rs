@@ -4,8 +4,10 @@ use crate::{
     theme::{color, palette},
     widgets,
 };
+use gpui_kit::component::Selectable;
 use gpui_kit::{
-    component::{Disableable, button::Button},
+    component::{Disableable, IconName},
+    prelude::FluentBuilder,
     *,
 };
 use serde_json::{Value, json};
@@ -81,7 +83,7 @@ fn log_prefs_path() -> std::path::PathBuf {
         .unwrap_or_else(|| "native-logs.json".into())
 }
 fn default_log_ui() -> Value {
-    json!({"sort":"timestamp","direction":"desc","severity":"all","service":"all","columns":["timestamp","service","severity","body"],"widths":{"timestamp":220,"service":150,"severity":110,"name":150,"body":320},"checked":[],"configure":false,"confirm":""})
+    json!({"sort":"timestamp","direction":"desc","severity":"all","service":"all","columns":["severity","timestamp","service","body"],"widths":{"timestamp":220,"service":150,"severity":110,"name":150,"body":320},"checked":[],"configure":false,"confirm":""})
 }
 fn persisted_log_ui() -> Value {
     let mut result = default_log_ui();
@@ -109,15 +111,35 @@ fn save_log_ui(ui: &Value) {
 impl Viewer {
     fn log_ui(&mut self) -> Value {
         if !self.data.contains_key("logs.ui") {
-            self.data.insert("logs.ui".into(), persisted_log_ui());
+            self.data.insert(
+                "logs.ui".into(),
+                if self.persist_preferences {
+                    persisted_log_ui()
+                } else {
+                    default_log_ui()
+                },
+            );
         }
         self.data["logs.ui"].clone()
     }
     fn set_log_ui(&mut self, ui: Value, persist: bool) {
-        if persist {
+        if persist && self.persist_preferences {
             save_log_ui(&ui);
         }
         self.data.insert("logs.ui".into(), ui);
+    }
+    fn sort_log_column(&mut self, key: &str, cx: &mut Context<Self>) {
+        let mut ui = self.log_ui();
+        let direction = if ui["sort"] == key && ui["direction"] == "desc" {
+            "asc"
+        } else {
+            "desc"
+        };
+        ui["sort"] = json!(key);
+        ui["direction"] = json!(direction);
+        self.set_log_ui(ui, true);
+        self.logs_offset = 0;
+        self.refresh_logs(cx);
     }
     fn log_params(&mut self, cx: &App) -> Value {
         let ui = self.log_ui();
@@ -243,7 +265,6 @@ impl Viewer {
     }
     pub fn render_logs(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let p = palette(self.prefs.dark);
-        let (_, details_width) = self.pane_widths(window);
         let ui = self.log_ui();
         let response = self.data.get("logs.page").cloned().unwrap_or(Value::Null);
         let rows = response["logs"].as_array().cloned().unwrap_or_default();
@@ -256,28 +277,58 @@ impl Viewer {
             .filter_map(|v| v.as_str().map(str::to_owned))
             .collect::<Vec<_>>();
         let checked = ui["checked"].as_array().cloned().unwrap_or_default();
-        let mut controls = div().flex().items_center().gap_1().p_2().flex_wrap();
+        let mut filters = div().flex().items_center().gap_2().px_3().py_1();
         let severity = ui["severity"].as_str().unwrap_or("all").to_owned();
-        controls = controls
+        filters = filters.child(
+            widgets::button("log-severity")
+                .label(format!("Severity: {severity}"))
+                .on_click(cx.listener(|this, _, _, cx| {
+                    let mut ui = this.log_ui();
+                    ui["severity"] = json!(match ui["severity"].as_str().unwrap_or("all") {
+                        "all" => "error",
+                        "error" => "warn",
+                        "warn" => "info",
+                        _ => "all",
+                    });
+                    this.set_log_ui(ui, false);
+                    this.logs_offset = 0;
+                    this.refresh_logs(cx);
+                })),
+        );
+        let controls = div()
+            .flex()
+            .items_center()
+            .gap_1()
+            .px_3()
+            .h(px(48.))
+            .flex_shrink_0()
+            .rounded_lg()
+            .bg(color(p.panel))
+            .child(format!(
+                "Logs · {}–{} of {total} records",
+                (self.logs_offset + 1).min(total as usize),
+                (self.logs_offset + rows.len()).min(total as usize)
+            ))
+            .child(div().flex_1())
             .child(
-                Button::new("log-severity")
-                    .label(format!("Severity: {severity}"))
+                widgets::button("log-filters")
+                    .icon(IconName::Settings2)
+                    .tooltip("Filter logs")
+                    .accessibility_label("Filter logs")
+                    .toggled(ui["filters"] == true)
+                    .selected(ui["filters"] == true)
                     .on_click(cx.listener(|this, _, _, cx| {
                         let mut ui = this.log_ui();
-                        ui["severity"] = json!(match ui["severity"].as_str().unwrap_or("all") {
-                            "all" => "error",
-                            "error" => "warn",
-                            "warn" => "info",
-                            _ => "all",
-                        });
+                        ui["filters"] = json!(ui["filters"] != true);
                         this.set_log_ui(ui, false);
-                        this.logs_offset = 0;
-                        this.refresh_logs(cx);
+                        cx.notify();
                     })),
             )
             .child(
-                Button::new("log-columns")
-                    .label("Columns")
+                widgets::button("log-columns")
+                    .icon(IconName::PanelLeft)
+                    .tooltip("Choose columns")
+                    .accessibility_label("Choose columns")
                     .on_click(cx.listener(|this, _, _, cx| {
                         let mut ui = this.log_ui();
                         ui["configure"] = json!(!ui["configure"].as_bool().unwrap_or(false));
@@ -294,8 +345,10 @@ impl Viewer {
                     })),
             )
             .child(
-                Button::new("log-select-page")
-                    .label("Select page")
+                widgets::button("log-select-page")
+                    .icon(IconName::Check)
+                    .tooltip("Select page")
+                    .accessibility_label("Select page")
                     .on_click({
                         let ids = rows
                             .iter()
@@ -317,8 +370,13 @@ impl Viewer {
                     }),
             )
             .child(
-                Button::new("log-delete-selected")
-                    .label(format!("Delete selected ({})", checked.len()))
+                widgets::button("log-delete-selected")
+                    .icon(IconName::Delete)
+                    .tooltip("Delete selected logs")
+                    .when(!checked.is_empty(), |button| {
+                        button.label(checked.len().to_string())
+                    })
+                    .accessibility_label("Delete selected logs")
                     .disabled(checked.is_empty())
                     .on_click(cx.listener(|this, _, _, cx| {
                         let mut ui = this.log_ui();
@@ -330,8 +388,10 @@ impl Viewer {
                     })),
             )
             .child(
-                Button::new("log-delete-all")
-                    .label("Delete all")
+                widgets::button("log-delete-all")
+                    .icon(IconName::Delete)
+                    .tooltip("Delete all logs")
+                    .accessibility_label("Delete all logs")
                     .on_click(cx.listener(|this, _, _, cx| {
                         let mut ui = this.log_ui();
                         ui["confirm"] = json!("all");
@@ -383,8 +443,8 @@ impl Viewer {
             .map(|(_, label)| label.as_str())
             .unwrap_or("All services")
             .to_owned();
-        controls = controls.child(
-            Button::new("log-service")
+        filters = filters.child(
+            widgets::button("log-service")
                 .label(format!("Service: {label}"))
                 .on_click(cx.listener(move |this, _, _, cx| {
                     let mut u = this.log_ui();
@@ -416,41 +476,38 @@ impl Viewer {
             .flex_col()
             .bg(color(p.canvas))
             .rounded_lg()
-            .child(
-                div()
-                    .flex()
-                    .justify_between()
-                    .items_center()
-                    .child(widgets::heading(format!("Logs · {total}"), p)),
-            )
             .child(controls);
+        if ui["filters"] == true {
+            main = main.child(filters);
+        }
         if ui["confirm"] != "" {
             let all = ui["confirm"] == "all";
-            main =
-                main.child(
-                    div()
-                        .flex()
-                        .gap_2()
-                        .p_2()
-                        .child(if all {
-                            "Delete all logs?"
-                        } else {
-                            "Delete selected logs?"
-                        })
-                        .child(
-                            Button::new("confirm-log-delete").label("Delete").on_click(
-                                cx.listener(move |this, _, _, cx| this.delete_logs(all, cx)),
-                            ),
-                        )
-                        .child(Button::new("cancel-log-delete").label("Cancel").on_click(
-                            cx.listener(|this, _, _, cx| {
+            main = main.child(
+                div()
+                    .flex()
+                    .gap_2()
+                    .p_2()
+                    .child(if all {
+                        "Delete all logs?"
+                    } else {
+                        "Delete selected logs?"
+                    })
+                    .child(
+                        widgets::button("confirm-log-delete")
+                            .label("Delete")
+                            .on_click(cx.listener(move |this, _, _, cx| this.delete_logs(all, cx))),
+                    )
+                    .child(
+                        widgets::button("cancel-log-delete")
+                            .label("Cancel")
+                            .on_click(cx.listener(|this, _, _, cx| {
                                 let mut u = this.log_ui();
                                 u["confirm"] = json!("");
                                 this.set_log_ui(u, false);
                                 cx.notify();
-                            }),
-                        )),
-                );
+                            })),
+                    ),
+            );
         }
         if ui["configure"].as_bool() == Some(true) {
             let mut bar = div().flex().flex_wrap().gap_1().p_2();
@@ -474,7 +531,7 @@ impl Viewer {
                 let enabled = visible.iter().any(|v| v == &key);
                 let toggle_key = key.clone();
                 bar = bar.child(
-                    Button::new(format!("col-{key}"))
+                    widgets::button(format!("col-{key}"))
                         .label(format!("{} {label}", if enabled { "✓" } else { "○" }))
                         .on_click(cx.listener(move |this, _, _, cx| {
                             let mut u = this.log_ui();
@@ -495,7 +552,7 @@ impl Viewer {
                     for (sign, delta) in [("−", -20), ("+", 20)] {
                         let width_key = key.clone();
                         bar = bar.child(
-                            Button::new(format!("width-{key}-{sign}"))
+                            widgets::button(format!("width-{key}-{sign}"))
                                 .label(sign)
                                 .accessibility_label(format!(
                                     "{} width for {label}",
@@ -514,13 +571,21 @@ impl Viewer {
             }
             main = main.child(bar);
         }
+        let table_width = 44.
+            + visible
+                .iter()
+                .map(|key| ui["widths"][key].as_f64().unwrap_or(150.) as f32 + 8.)
+                .sum::<f32>();
+        // Fixed column coordinates share the row widths even when the grid is
+        // wider than its viewport and horizontally scrolled.
+        let mut column_offset = 44.;
         let mut header = div()
-            .flex()
-            .px_2()
-            .py_2()
-            .gap_2()
-            .bg(color(p.chrome))
-            .child(div().w(px(28.)).child("✓"));
+            .relative()
+            .w(px(table_width))
+            .h(px(40.))
+            .flex_shrink_0()
+            .text_size(px(13.))
+            .bg(color(p.canvas));
         for key in &visible {
             let key = key.clone();
             let label = COLUMNS
@@ -529,8 +594,18 @@ impl Viewer {
                 .map(|(_, l)| (*l).to_owned())
                 .unwrap_or_else(|| key.strip_prefix("attr:").unwrap_or(&key).replace(':', ": "));
             let width = ui["widths"][&key].as_f64().unwrap_or(150.) as f32;
+            let cell = div()
+                .absolute()
+                .left(px(column_offset))
+                .top_0()
+                .w(px(width))
+                .h_full()
+                .flex()
+                .items_center()
+                .overflow_hidden();
+            column_offset += width + 8.;
             if log_projection(&key).is_some() {
-                header = header.child(div().w(px(width)).child(label));
+                header = header.child(cell.child(label));
                 continue;
             }
             let marker = if ui["sort"] == key {
@@ -542,28 +617,31 @@ impl Viewer {
             } else {
                 ""
             };
+            // Use the unstyled native button so clipped column headers keep
+            // their text at the column origin while retaining keyboard/a11y behavior.
             header = header.child(
-                div().w(px(width)).child(
-                    Button::new(format!("sort-{key}"))
-                        .label(format!("{label}{marker}"))
+                cell.child(
+                    gpui_kit::base::Button::new(format!("sort-{key}"))
+                        .accessibility_label(format!("Sort by {label}{marker}"))
+                        .w(px(width))
+                        .h(px(32.))
+                        .flex()
+                        .items_center()
+                        .justify_start()
+                        .text_size(px(13.))
+                        .text_ellipsis()
+                        .rounded_sm()
+                        .cursor_pointer()
+                        .hover(|style| style.bg(color(p.selection)))
+                        .focus_visible(|style| style.border_1().border_color(color(p.accent)))
                         .on_click(cx.listener(move |this, _, _, cx| {
-                            let mut u = this.log_ui();
-                            let dir = if u["sort"] == key && u["direction"] == "desc" {
-                                "asc"
-                            } else {
-                                "desc"
-                            };
-                            u["sort"] = json!(key);
-                            u["direction"] = json!(dir);
-                            this.set_log_ui(u, true);
-                            this.logs_offset = 0;
-                            this.refresh_logs(cx);
-                        })),
+                            this.sort_log_column(&key, cx);
+                        }))
+                        .child(format!("{label}{marker}")),
                 ),
             );
         }
-        main = main.child(header);
-        let mut table = div().id("log-table").flex_1().overflow_y_scroll();
+        let mut table = div().id("log-table").flex_1().min_h_0().overflow_y_scroll();
         for (index, row) in rows.iter().enumerate() {
             let id = field(row, "logRef");
             let selected = self.selected_log.as_ref() == Some(&id);
@@ -579,16 +657,22 @@ impl Viewer {
             let mut line = div()
                 .id(("log-row", index))
                 .flex()
+                .items_center()
                 .gap_2()
                 .px_2()
-                .py_2()
-                .bg(color(if selected { p.selection } else { p.canvas }))
-                .border_b_1()
-                .border_color(color(p.chrome));
+                .h(px(40.))
+                .rounded_lg()
+                .bg(color(if selected { p.selection } else { p.canvas }));
             line = line.child(
-                div().w(px(28.)).child(
-                    Button::new(format!("check-log-{index}"))
-                        .label(if checked_row { "☑" } else { "☐" })
+                div().w(px(28.)).flex_shrink_0().child(
+                    widgets::button(format!("check-log-{index}"))
+                        .icon(if checked_row {
+                            IconName::CircleCheck
+                        } else {
+                            IconName::Square
+                        })
+                        .w(px(24.))
+                        .text_size(px(13.))
                         .accessibility_label(check_label)
                         .on_click(cx.listener(move |this, _, _, cx| {
                             let mut u = this.log_ui();
@@ -625,6 +709,7 @@ impl Viewer {
                 line = line.child(
                     div()
                         .w(px(width))
+                        .flex_shrink_0()
                         .overflow_hidden()
                         .text_color(color(if key == "severity" && severity >= 17 {
                             p.error
@@ -632,9 +717,24 @@ impl Viewer {
                             p.subtle
                         }))
                         .child(
-                            Button::new(format!("cell-{index}-{key}"))
+                            widgets::button(format!("cell-{index}-{key}"))
                                 .accessibility_label(format!("Inspect log, {key}: {accessible}"))
-                                .label(accessible)
+                                .child(
+                                    div()
+                                        .w_full()
+                                        .text_ellipsis()
+                                        .text_color(color(if key == "severity" && severity >= 17 {
+                                            p.error
+                                        } else {
+                                            p.text
+                                        }))
+                                        .child(accessible),
+                                )
+                                .text_size(px(13.))
+                                .w_full()
+                                .justify_start()
+                                .px_0()
+                                .overflow_hidden()
                                 .on_click(cx.listener(move |this, _, _, cx| {
                                     this.select_log(select_id.clone(), cx)
                                 })),
@@ -654,8 +754,10 @@ impl Viewer {
         let mut footer = div().flex().justify_between().items_center().p_2().gap_1();
         footer = footer
             .child(
-                Button::new("logs-prev")
-                    .label("Previous page")
+                widgets::button("logs-prev")
+                    .icon(IconName::ChevronLeft)
+                    .tooltip("Previous page")
+                    .accessibility_label("Previous page")
                     .disabled(self.logs_offset == 0)
                     .on_click(cx.listener(|this, _, _, cx| {
                         this.logs_offset = this.logs_offset.saturating_sub(this.page_size);
@@ -668,8 +770,10 @@ impl Viewer {
                 (self.logs_offset + rows.len()).min(total as usize)
             ))
             .child(
-                Button::new("logs-next")
-                    .label("Next page")
+                widgets::button("logs-next")
+                    .icon(IconName::ChevronRight)
+                    .tooltip("Next page")
+                    .accessibility_label("Next page")
                     .disabled(self.logs_offset + self.page_size >= total as usize)
                     .on_click(cx.listener(move |this, _, _, cx| {
                         if this.logs_offset + this.page_size < total as usize {
@@ -679,7 +783,7 @@ impl Viewer {
                     })),
             );
         footer = footer.child(
-            Button::new("log-page-size")
+            widgets::button("log-page-size")
                 .label(format!("{} / page", self.page_size))
                 .on_click(cx.listener(|this, _, _, cx| {
                     this.page_size = match this.page_size {
@@ -700,7 +804,7 @@ impl Viewer {
                     .to_owned();
                 let offset = target.get("offset").and_then(Value::as_u64).unwrap_or(0) as usize;
                 footer = footer.child(
-                    Button::new(format!("log-error-{key}"))
+                    widgets::button(format!("log-error-{key}"))
                         .label(label)
                         .on_click(cx.listener(move |this, _, _, cx| {
                             this.logs_offset = offset / this.page_size * this.page_size;
@@ -712,49 +816,105 @@ impl Viewer {
                 );
             }
         }
-        main = main.child(table).child(footer);
-        let mut shell = div().flex().size_full().gap_2().child(main);
-        if self.prefs.details_open {
+        main = main
+            .child(
+                div()
+                    .id("log-grid")
+                    .test_support()
+                    .flex_1()
+                    .min_h_0()
+                    .overflow_x_scroll()
+                    .child(
+                        div()
+                            .w(px(table_width))
+                            .min_w_full()
+                            .h_full()
+                            .flex()
+                            .flex_col()
+                            .child(header)
+                            .child(table),
+                    ),
+            )
+            .child(footer);
+        let details = if self.prefs.details_open {
             let data = self.data.get("logs.detail").cloned().unwrap_or(Value::Null);
             let mut details = div()
                 .id("log-details")
-                .w(px(details_width))
-                .h_full()
+                .size_full()
                 .overflow_y_scroll()
-                .bg(color(p.panel))
-                .rounded_lg()
-                .child(widgets::heading("Log details", p));
+                .bg(color(p.canvas))
+                .rounded_lg();
             if !data.is_null() {
                 let copy = serde_json::to_string_pretty(&data).unwrap_or_default();
                 let reference = self.selected_log.clone().unwrap_or_default();
                 let delete_ref = reference.clone();
                 let copy_otlp_ref = reference.clone();
-                details = details.child(
-                    div()
-                        .flex()
-                        .gap_1()
-                        .p_2()
-                        .child(Button::new("copy-log").label("Copy JSON").on_click(
-                            move |_, _, cx| {
+                let json_mode = self
+                    .data
+                    .get("ui.log.json")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+                let actions = div()
+                    .flex()
+                    .items_center()
+                    .gap_1()
+                    .child(
+                        widgets::button("log-properties")
+                            .label("Properties")
+                            .toggled(!json_mode)
+                            .selected(!json_mode)
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.data.remove("ui.log.json");
+                                cx.notify();
+                            })),
+                    )
+                    .child(
+                        widgets::button("log-json-view")
+                            .label("JSON")
+                            .toggled(json_mode)
+                            .selected(json_mode)
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.data.insert("ui.log.json".into(), json!(true));
+                                cx.notify();
+                            })),
+                    )
+                    .child(
+                        widgets::button("copy-log")
+                            .icon(IconName::Copy)
+                            .w(px(24.))
+                            .tooltip("Copy log JSON")
+                            .accessibility_label("Copy log JSON")
+                            .on_click(move |_, _, cx| {
                                 cx.write_to_clipboard(ClipboardItem::new_string(copy.clone()))
-                            },
-                        ))
-                        .child(
-                            Button::new("copy-log-otlp")
-                                .label("Copy OTLP JSON")
-                                .on_click(cx.listener(move |this, _, _, cx| {
-                                    this.copy_otlp("logs", copy_otlp_ref.clone(), None, cx)
-                                })),
-                        )
-                        .child(
-                            Button::new("export-log")
-                                .label("Export")
-                                .on_click(cx.listener(move |this, _, _, cx| {
-                                    this.export_record("logs", reference.clone(), None, cx)
-                                })),
-                        )
-                        .child(Button::new("delete-current-log").label("Delete").on_click(
-                            cx.listener(move |this, _, _, cx| {
+                            }),
+                    )
+                    .child(
+                        widgets::button("copy-log-otlp")
+                            .icon(IconName::FileText)
+                            .w(px(24.))
+                            .tooltip("Copy OTLP JSON")
+                            .accessibility_label("Copy OTLP JSON")
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.copy_otlp("logs", copy_otlp_ref.clone(), None, cx)
+                            })),
+                    )
+                    .child(
+                        widgets::button("export-log")
+                            .icon(IconName::ArrowDown)
+                            .w(px(24.))
+                            .tooltip("Export log")
+                            .accessibility_label("Export log")
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.export_record("logs", reference.clone(), None, cx)
+                            })),
+                    )
+                    .child(
+                        widgets::button("delete-current-log")
+                            .icon(IconName::Delete)
+                            .w(px(24.))
+                            .tooltip("Delete log")
+                            .accessibility_label("Delete log")
+                            .on_click(cx.listener(move |this, _, _, cx| {
                                 let mut ui = this.log_ui();
                                 if delete_ref.is_empty() {
                                     return;
@@ -762,32 +922,40 @@ impl Viewer {
                                 ui["confirm"] = json!("current");
                                 this.set_log_ui(ui, false);
                                 cx.notify();
-                            }),
-                        )),
-                );
+                            })),
+                    );
                 let mut summary = div().flex().flex_col();
-                summary = summary.child(widgets::property("Body", attribute(&data["body"]), p));
                 for (key, label) in [
-                    ("timestamp", "Timestamp"),
-                    ("observedTimestamp", "Observed time"),
+                    ("timestamp", "timeUnixNano · fixed64"),
+                    ("observedTimestamp", "observedTimeUnixNano · fixed64"),
                 ] {
-                    summary = summary.child(widgets::property(
+                    summary = summary.child(widgets::property_exact(
                         label,
-                        format_timestamp(ns(&data[key])),
+                        format!(
+                            "{}\n{}",
+                            format_timestamp(ns(&data[key])),
+                            field(&data, key)
+                        ),
+                        field(&data, key),
                         p,
                     ));
                 }
                 for (key, label) in [
-                    ("severityText", "Severity"),
-                    ("severityNumber", "Severity number"),
-                    ("eventName", "Event name"),
-                    ("traceID", "Trace ID"),
-                    ("spanID", "Span ID"),
-                    ("flags", "Flags"),
-                    ("droppedAttributesCount", "Dropped attributes"),
+                    ("severityText", "severityText · string"),
+                    ("severityNumber", "severityNumber · enum"),
+                    ("eventName", "eventName · string"),
+                    ("traceID", "traceId · bytes"),
+                    ("spanID", "spanId · bytes"),
+                    ("flags", "flags · uint32"),
+                    ("droppedAttributesCount", "droppedAttributesCount · uint32"),
                 ] {
                     summary = summary.child(widgets::property(label, field(&data, key), p));
                 }
+                summary = summary.child(widgets::property(
+                    format!("body · {}", field(&data["body"], "kind")),
+                    attribute(&data["body"]),
+                    p,
+                ));
                 if let Some(trace) = data["traceID"].as_str().filter(|s| !s.is_empty()) {
                     let trace = trace.to_owned();
                     let span = data["spanID"]
@@ -795,7 +963,7 @@ impl Viewer {
                         .filter(|s| !s.is_empty() && s.chars().any(|c| c != '0'))
                         .map(str::to_owned);
                     summary = summary.child(
-                        Button::new("log-open-trace")
+                        widgets::button("log-open-trace")
                             .label("Open associated trace")
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 this.select_trace(trace.clone(), cx);
@@ -805,17 +973,14 @@ impl Viewer {
                             })),
                     );
                 }
-                let mut sections = vec![crate::detail_stack::DetailSection::new(
-                    "summary", "Log", summary,
-                )];
                 for (key, label) in [
                     ("attributes", "Attributes"),
                     ("resource", "Resource"),
                     ("scope", "Scope"),
-                    ("body", "Received body"),
                 ] {
-                    let content = self.detail_json(&format!("log.{key}"), &data[key], 0, cx);
-                    sections.push(crate::detail_stack::DetailSection::new(key, label, content));
+                    summary = summary
+                        .child(widgets::heading(label, p))
+                        .child(self.attribute_table(&format!("log.{key}"), &data[key], cx));
                 }
                 let raw = self.raw_otlp_inspector(
                     "log",
@@ -824,11 +989,16 @@ impl Viewer {
                     None,
                     cx,
                 );
-                sections.push(crate::detail_stack::DetailSection::new(
-                    "otlp",
-                    "Raw OTLP JSON",
-                    raw,
-                ));
+                summary = summary.child(raw);
+                let primary = if json_mode {
+                    self.detail_json("log-json", &data, 0, cx)
+                } else {
+                    summary.into_any_element()
+                };
+                let sections = vec![
+                    crate::detail_stack::DetailSection::new("summary", "Log", primary)
+                        .actions(actions),
+                ];
                 details = details.child(self.detail_stack("logs", sections, cx));
             } else {
                 details = details.child(widgets::empty(
@@ -836,9 +1006,11 @@ impl Viewer {
                     p,
                 ));
             }
-            shell = shell.child(details);
-        }
-        shell.into_any_element()
+            Some(details.into_any_element())
+        } else {
+            None
+        };
+        self.render_workspace(None, main.into_any_element(), details, window)
     }
 }
 

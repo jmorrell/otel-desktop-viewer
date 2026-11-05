@@ -55,10 +55,16 @@ selection. Import reports, signal exports, appearance settings, adjustable
 panels, storage usage, ingestion rejection diagnostics, and configured OTLP
 addresses with copyable SDK environment settings are also available.
 
-The native Home map uses stable radial placement; it does not reproduce the
-web's force-directed motion. Attribute keys and expanded value previews use a
-split inspector, and the three adjustable panes retain a fixed order. Key
-coverage is reported for the selected signal and owner. Native builds use the
+The native views follow the web viewer's navigation, compact headers, signal
+cards, typed property tables, and seasonal interface palettes. Home keeps the
+service map in the center and selected-service telemetry and attributes in the
+right pane. The map uses stable placement rather than force-directed motion.
+Both side panes resize by dragging their dividers; widths persist across
+launches. Below 1280 pixels, Home, traces, and metrics stack the main view and
+Details beside the list, with a draggable horizontal divider. Logs keep their
+table and inspector side by side. Detail sections retain separate scroll
+positions and adjustable heights. Key coverage is reported for the selected
+signal and owner. Native builds use the
 public `EVALS=0` backend. The local app is ad-hoc signed and is not notarized;
 distribution requires the distributor's Apple signing and notarization.
 
@@ -69,7 +75,7 @@ backend integration target. To run the tests directly:
 
 ```sh
 cargo fmt --manifest-path native/Cargo.toml -- --check
-cargo check --locked --manifest-path native/Cargo.toml --tests
+cargo check --locked --manifest-path native/Cargo.toml --tests --test native_ui
 cargo test --locked --manifest-path native/Cargo.toml --bin otel-desktop-native
 cargo test --locked --manifest-path native/Cargo.toml --test backend_integration
 python3 native/scripts/smoke-stdio.py dist/native/otel-desktop-backend

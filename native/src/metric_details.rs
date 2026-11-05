@@ -4,7 +4,8 @@ use crate::{
     theme::{color, palette},
     widgets,
 };
-use gpui_kit::{component::button::Button, *};
+use gpui_kit::component::Selectable;
+use gpui_kit::{component::IconName, *};
 use serde_json::{Value, json};
 use std::{sync::mpsc, time::Duration};
 
@@ -59,7 +60,7 @@ impl Viewer {
         let signal = signal.to_owned();
         let instance = instance.to_owned();
         let mut section = div().flex().flex_col().child(
-            Button::new(SharedString::from(format!("raw-toggle-{instance}")))
+            widgets::button(SharedString::from(format!("raw-toggle-{instance}")))
                 .label(if open {
                     "Hide raw OTLP JSON"
                 } else {
@@ -246,9 +247,8 @@ impl Viewer {
             .w(px(width))
             .h_full()
             .overflow_y_scroll()
-            .bg(color(p.panel))
-            .rounded_lg()
-            .child(widgets::heading("Metric details", p));
+            .bg(color(p.canvas))
+            .rounded_lg();
         if metric.is_null() {
             return details
                 .child(widgets::empty(
@@ -262,53 +262,101 @@ impl Viewer {
         let export_ref = metric_ref.clone();
         let definition_ref = metric_ref.clone();
         let copy_otlp_ref = metric_ref.clone();
-        details = details.child(
-            div()
-                .flex()
-                .flex_wrap()
-                .gap_1()
-                .p_2()
-                .child(
-                    Button::new("copy-metric-json")
-                        .label("Copy metric JSON")
-                        .on_click(move |_, _, cx| {
-                            cx.write_to_clipboard(ClipboardItem::new_string(copy.clone()))
-                        }),
-                )
-                .child(
-                    Button::new("copy-metric-otlp")
-                        .label("Copy OTLP JSON")
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            this.copy_otlp("metrics", copy_otlp_ref.clone(), None, cx)
-                        })),
-                )
-                .child(
-                    Button::new("export-metric")
-                        .label("Export metric")
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            this.export_record("metrics", export_ref.clone(), None, cx)
-                        })),
-                )
-                .child(
-                    Button::new("export-metric-definition")
-                        .label("Export definition only")
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            this.export_metric_definition(definition_ref.clone(), cx)
-                        })),
-                ),
-        );
+        let json_mode = self
+            .data
+            .get("ui.metric.json")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let actions = div()
+            .flex()
+            .items_center()
+            .gap_1()
+            .child(
+                widgets::button("metric-properties")
+                    .label("Properties")
+                    .toggled(!json_mode)
+                    .selected(!json_mode)
+                    .accessibility_label("Metric properties")
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.data.remove("ui.metric.json");
+                        cx.notify();
+                    })),
+            )
+            .child(
+                widgets::button("metric-json-view")
+                    .label("JSON")
+                    .toggled(json_mode)
+                    .selected(json_mode)
+                    .accessibility_label("View metric JSON")
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.data.insert("ui.metric.json".into(), json!(true));
+                        cx.notify();
+                    })),
+            )
+            .child(
+                widgets::button("copy-metric-json")
+                    .icon(IconName::Copy)
+                    .w(px(24.))
+                    .tooltip("Copy metric JSON")
+                    .accessibility_label("Copy metric JSON")
+                    .on_click(move |_, _, cx| {
+                        cx.write_to_clipboard(ClipboardItem::new_string(copy.clone()))
+                    }),
+            )
+            .child(
+                widgets::button("copy-metric-otlp")
+                    .icon(IconName::FileText)
+                    .w(px(24.))
+                    .tooltip("Copy OTLP JSON")
+                    .accessibility_label("Copy OTLP JSON")
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.copy_otlp("metrics", copy_otlp_ref.clone(), None, cx)
+                    })),
+            )
+            .child(
+                widgets::button("export-metric")
+                    .icon(IconName::ArrowDown)
+                    .w(px(24.))
+                    .tooltip("Export metric")
+                    .accessibility_label("Export metric")
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.export_record("metrics", export_ref.clone(), None, cx)
+                    })),
+            )
+            .child(
+                widgets::button("export-metric-definition")
+                    .icon(IconName::File)
+                    .w(px(24.))
+                    .tooltip("Export definition only")
+                    .accessibility_label("Export definition only")
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.export_metric_definition(definition_ref.clone(), cx)
+                    })),
+            );
         let raw_metric = self.raw_otlp_inspector("metric", "metrics", metric_ref.clone(), None, cx);
         let mut summary = div().flex().flex_col();
         for (key, label) in [
-            ("name", "Name"),
-            ("description", "Description"),
-            ("metricType", "Type"),
-            ("unit", "Unit"),
-            ("aggregationTemporalityCode", "Temporality code"),
-            ("isMonotonic", "Monotonic"),
+            ("name", "name · string"),
+            ("description", "description · string"),
+            ("metricType", "type · string"),
+            ("unit", "unit · string"),
+            (
+                "aggregationTemporalityCode",
+                "aggregationTemporality · enum",
+            ),
+            ("isMonotonic", "isMonotonic · bool"),
         ] {
             if !metric[key].is_null() {
-                summary = summary.child(widgets::property(label, exact_value(&metric[key]), p));
+                let value = if key == "aggregationTemporalityCode" {
+                    match metric[key].as_i64() {
+                        Some(1) => "Delta".into(),
+                        Some(2) => "Cumulative".into(),
+                        _ => exact_value(&metric[key]),
+                    }
+                } else {
+                    exact_value(&metric[key])
+                };
+                summary = summary.child(widgets::property(label, value, p));
             }
         }
         if matches!(
@@ -323,7 +371,7 @@ impl Viewer {
                 summary = summary
                     .child(widgets::heading("Selected chart bucket (derived)", p))
                     .child(
-                        Button::new("clear-metric-bucket")
+                        widgets::button("clear-metric-bucket")
                             .label("Clear bucket selection")
                             .on_click(cx.listener(|this, _, _, cx| {
                                 this.data.remove("metrics.bucket");
@@ -333,57 +381,35 @@ impl Viewer {
                     .child(self.detail_json("metric-derived-bucket", &bucket, 0, cx));
             }
         }
-        let mut sections = vec![crate::detail_stack::DetailSection::new(
-            "summary", "Metric", summary,
-        )];
         for (key, label) in [
             ("metadata", "Metadata"),
             ("resource", "Resource"),
             ("scope", "Scope"),
         ] {
-            let content = self.detail_json(&format!("metric-exact-{key}"), &metric[key], 0, cx);
-            sections.push(crate::detail_stack::DetailSection::new(key, label, content));
-        }
-        let mut series_view = div().flex().flex_col();
-        if let Some(items) = metric["series"].as_array() {
-            series_view =
-                series_view.child(widgets::heading(format!("Series · {}", items.len()), p));
-            for (i, item) in items.iter().enumerate() {
-                let id = field(item, "seriesRef");
-                let title = item["attributes"]
-                    .as_array()
-                    .map(|attrs| {
-                        attrs
-                            .iter()
-                            .map(|a| {
-                                format!(
-                                    "{}={}",
-                                    field(a, "key"),
-                                    crate::model::attribute(&a["value"])
-                                )
-                            })
-                            .collect::<Vec<_>>()
-                            .join(" · ")
-                    })
-                    .filter(|s| !s.is_empty())
-                    .unwrap_or_else(|| "(no attributes)".into());
-                let marker = if self.selected_series.as_ref() == Some(&id) {
-                    "● "
-                } else {
-                    ""
-                };
-                series_view = series_view.child(
-                    Button::new(("metric-detail-series", i))
-                        .label(format!(
-                            "{marker}{title} · {} points",
-                            exact_value(&item["datapointCount"])
-                        ))
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            this.select_metric_series(id.clone(), cx)
-                        })),
-                );
+            if !metric[key].is_null() {
+                summary = summary
+                    .child(widgets::heading(label, p))
+                    .child(self.attribute_table(&format!("metric-exact-{key}"), &metric[key], cx));
             }
         }
+        summary = summary.child(raw_metric);
+        let summary = if self.data.get("ui.metric.json") == Some(&json!(true)) {
+            self.detail_json("metric-projection-json", &metric, 0, cx)
+        } else {
+            summary.into_any_element()
+        };
+        let mut sections = vec![
+            crate::detail_stack::DetailSection::new("summary", "Metric", summary).actions(actions),
+        ];
+        let plotted = self
+            .data
+            .get("metrics.view")
+            .cloned()
+            .unwrap_or(Value::Null);
+        let mut series_view = div()
+            .flex()
+            .flex_col()
+            .child(self.render_metric_series(&plotted, cx));
         let mut points_view = div().flex().flex_col();
         if !series.is_null() {
             let series_ref = field(&series, "seriesRef");
@@ -400,14 +426,14 @@ impl Viewer {
                         .gap_1()
                         .p_2()
                         .child(
-                            Button::new("copy-series-json")
+                            widgets::button("copy-series-json")
                                 .label("Copy series JSON")
                                 .on_click(move |_, _, cx| {
                                     cx.write_to_clipboard(ClipboardItem::new_string(copy.clone()))
                                 }),
                         )
                         .child(
-                            Button::new("copy-series-otlp")
+                            widgets::button("copy-series-otlp")
                                 .label("Copy series OTLP")
                                 .on_click(cx.listener(move |this, _, _, cx| {
                                     this.copy_otlp(
@@ -419,7 +445,7 @@ impl Viewer {
                                 })),
                         )
                         .child(
-                            Button::new("export-series")
+                            widgets::button("export-series")
                                 .label("Export series")
                                 .on_click(cx.listener(move |this, _, _, cx| {
                                     this.export_record(
@@ -439,7 +465,7 @@ impl Viewer {
                     cx,
                 ))
                 .child(widgets::heading("Series attributes", p))
-                .child(self.detail_json("metric-series-attributes", &series["attributes"], 0, cx));
+                .child(self.attribute_table("metric-series-attributes", &series["attributes"], cx));
             if let Some(points) = series["datapoints"].as_array() {
                 points_view = points_view.child(widgets::heading(
                     format!("Received datapoints · {}", points.len()),
@@ -504,7 +530,7 @@ impl Viewer {
                         .gap_1()
                         .p_2()
                         .child(
-                            Button::new("metric-points-prev")
+                            widgets::button("metric-points-prev")
                                 .label("Previous page")
                                 .on_click(cx.listener(move |this, _, _, cx| {
                                     this.data.insert(
@@ -520,7 +546,7 @@ impl Viewer {
                             (offset + size).min(total)
                         ))
                         .child(
-                            Button::new("metric-points-next")
+                            widgets::button("metric-points-next")
                                 .label("Next page")
                                 .on_click(cx.listener(move |this, _, _, cx| {
                                     if offset + size < total {
@@ -533,7 +559,7 @@ impl Viewer {
                                 })),
                         )
                         .child(
-                            Button::new("metric-points-size")
+                            widgets::button("metric-points-size")
                                 .label(format!("{size} / page"))
                                 .on_click(cx.listener(move |this, _, _, cx| {
                                     let next = match size {
@@ -552,7 +578,7 @@ impl Viewer {
                     let selected = self.selected_point.as_ref() == Some(&point_ref);
                     let selected_ref = point_ref.clone();
                     points_view = points_view.child(
-                        Button::new(("metric-detail-point", i))
+                        widgets::button(("metric-detail-point", i))
                             .label(format!(
                                 "{}{}",
                                 if selected { "● " } else { "" },
@@ -577,7 +603,7 @@ impl Viewer {
                                 .gap_1()
                                 .p_2()
                                 .child(
-                                    Button::new(("copy-point", i))
+                                    widgets::button(("copy-point", i))
                                         .label("Copy datapoint JSON")
                                         .on_click(move |_, _, cx| {
                                             cx.write_to_clipboard(ClipboardItem::new_string(
@@ -586,7 +612,7 @@ impl Viewer {
                                         }),
                                 )
                                 .child(
-                                    Button::new(("copy-point-otlp", i))
+                                    widgets::button(("copy-point-otlp", i))
                                         .label("Copy datapoint OTLP")
                                         .on_click(cx.listener(move |this, _, _, cx| {
                                             this.copy_otlp(
@@ -598,7 +624,7 @@ impl Viewer {
                                         })),
                                 )
                                 .child(
-                                    Button::new(("export-point", i))
+                                    widgets::button(("export-point", i))
                                         .label("Export datapoint")
                                         .on_click(cx.listener(move |this, _, _, cx| {
                                             this.export_record(
@@ -675,7 +701,7 @@ impl Viewer {
                                         .map(str::to_owned);
                                     points_view =
                                         points_view.child(
-                                            Button::new((
+                                            widgets::button((
                                                 SharedString::from(format!("exemplar-trace-{i}")),
                                                 j,
                                             ))
@@ -699,16 +725,11 @@ impl Viewer {
             "Series",
             series_view,
         ));
-        sections.push(crate::detail_stack::DetailSection::new(
-            "datapoints",
-            "Datapoints",
-            points_view,
-        ));
-        sections.push(crate::detail_stack::DetailSection::new(
-            "otlp",
-            "Raw OTLP JSON",
-            raw_metric,
-        ));
+        sections.push(
+            crate::detail_stack::DetailSection::new("datapoints", "Datapoints", points_view)
+                .initially_open(false),
+        );
+
         details = details.child(self.detail_stack("metrics", sections, cx));
         details.into_any_element()
     }

@@ -44,6 +44,7 @@ pub(crate) struct Preferences {
     pub list_width: f32,
     pub details_width: f32,
     pub trace_label_width: f32,
+    pub stacked_main_height: f32,
     pub detail_layout: HashMap<String, Vec<crate::detail_stack::SectionPreference>>,
 }
 impl Default for Preferences {
@@ -55,9 +56,10 @@ impl Default for Preferences {
             ink: usize::MAX,
             list_open: true,
             details_open: true,
-            list_width: 290.,
-            details_width: 360.,
+            list_width: 432.,
+            details_width: 448.,
             trace_label_width: 260.,
+            stacked_main_height: 240.,
             detail_layout: HashMap::new(),
         }
     }
@@ -90,8 +92,12 @@ pub(crate) struct Viewer {
     pub appearance_focus: FocusHandle,
     pub appearance_trigger_focus: FocusHandle,
     pub resizing: Option<(bool, f32, f32)>,
+    pub resizing_stack: Option<(f32, f32)>,
     pub trace_resizing: Option<(f32, f32)>,
     pub detail_resizing: Option<(String, String, f32, f32)>,
+    pub details_available_height: f32,
+    pub detail_scales: HashMap<String, f32>,
+    pub detail_open: HashMap<String, std::collections::HashSet<String>>,
     pub trace_label_render_width: f32,
     pub import_cancel: Arc<std::sync::atomic::AtomicBool>,
     pub import_active: bool,
@@ -173,8 +179,12 @@ impl Viewer {
             appearance_focus: cx.focus_handle(),
             appearance_trigger_focus: cx.focus_handle(),
             resizing: None,
+            resizing_stack: None,
             trace_resizing: None,
             detail_resizing: None,
+            details_available_height: 800.,
+            detail_scales: HashMap::new(),
+            detail_open: HashMap::new(),
             trace_label_render_width: 260.,
             import_cancel: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             import_active: false,
@@ -517,11 +527,21 @@ impl Viewer {
 impl Render for Viewer {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let p = palette(self.prefs.dark);
-        self.toolbar_height = if f32::from(window.viewport_size().width) < 1100. {
+        self.toolbar_height = if f32::from(window.viewport_size().width) < 1280. {
             88.
         } else {
             48.
         };
+        self.details_available_height = (f32::from(window.viewport_size().height)
+            - self.toolbar_height
+            - self.status_height()
+            - 32.
+            - if self.workspace_stacked(window) {
+                self.stacked_main_height(window) + 16.
+            } else {
+                0.
+            })
+        .max(200.);
         let content = match self.page {
             Page::Home => self.render_home(window, cx),
             Page::Traces => self.render_traces(window, cx),
@@ -536,17 +556,35 @@ impl Render for Viewer {
                 this.import_paths(paths.0.iter().cloned().collect(), cx)
             }))
             .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, window, cx| {
+                if let Some((origin, height)) = this.resizing_stack {
+                    if event.dragging() {
+                        this.prefs.stacked_main_height =
+                            (height + f32::from(event.position.y) - origin).max(140.);
+                        cx.notify();
+                    }
+                }
                 if let Some((signal, id, origin, height)) = this.detail_resizing.clone() {
                     if event.dragging() {
                         if let Some(layout) = this.prefs.detail_layout.get_mut(&signal) {
                             if let Some(index) = layout.iter().position(|s| s.id == id) {
-                                let desired = (height + f32::from(event.position.y) - origin)
+                                let scale = this
+                                    .detail_scales
+                                    .get(&signal)
+                                    .copied()
+                                    .unwrap_or(1.)
+                                    .max(0.01);
+                                let desired = (height
+                                    + (f32::from(event.position.y) - origin) / scale)
                                     .clamp(80., 1200.);
                                 let mut delta = desired - layout[index].height;
-                                if let Some(next) =
-                                    ((index + 1)..layout.len()).find(|i| !layout[*i].collapsed)
-                                {
-                                    delta = delta.min(layout[next].height - 80.);
+                                if let Some(next) = ((index + 1)..layout.len()).find(|i| {
+                                    this.detail_open
+                                        .get(&signal)
+                                        .is_some_and(|open| open.contains(&layout[*i].id))
+                                }) {
+                                    delta = delta
+                                        .min(layout[next].height - 80.)
+                                        .max(layout[next].height - 1200.);
                                     layout[next].height =
                                         (layout[next].height - delta).clamp(80., 1200.);
                                 }
@@ -582,7 +620,12 @@ impl Render for Viewer {
                 cx.listener(|this, _, _, cx| {
                     let trace_finished = this.trace_resizing.take().is_some();
                     let section_finished = this.detail_resizing.take().is_some();
-                    if this.resizing.take().is_some() || trace_finished || section_finished {
+                    let stack_finished = this.resizing_stack.take().is_some();
+                    if this.resizing.take().is_some()
+                        || trace_finished
+                        || section_finished
+                        || stack_finished
+                    {
                         this.save_preferences();
                         cx.notify();
                     }
@@ -630,14 +673,15 @@ impl Render for Viewer {
             .font_family("Atkinson Hyperlegible Next")
             .text_sm()
             .child(self.render_toolbar(window, cx))
-            .child(div().flex_1().min_h_0().child(content))
+            .child(div().flex_1().min_h_0().px_4().pt_6().pb_2().child(content))
             .child(
                 div()
                     .flex()
                     .items_center()
                     .justify_between()
                     .gap_3()
-                    .h(px(34.))
+                    .h(px(self.status_height()))
+                    .overflow_hidden()
                     .flex_shrink_0()
                     .px_3()
                     .text_color(color(p.subtle))
@@ -665,15 +709,23 @@ impl Render for Viewer {
             .children(self.pane_resize_handles(window, cx))
             .children(
                 if self.time_open || self.appearance_open || self.import_report_open {
-                    Some(div().absolute().inset_0().on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(|this, _, _, cx| {
-                            this.time_open = false;
-                            this.appearance_open = false;
-                            this.import_report_open = false;
-                            cx.notify();
-                        }),
-                    ))
+                    Some(
+                        div()
+                            .absolute()
+                            .left_0()
+                            .right_0()
+                            .top(px(self.toolbar_height))
+                            .bottom_0()
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(|this, _, _, cx| {
+                                    this.time_open = false;
+                                    this.appearance_open = false;
+                                    this.import_report_open = false;
+                                    cx.notify();
+                                }),
+                            ),
+                    )
                 } else {
                     None
                 },
