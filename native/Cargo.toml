@@ -1,0 +1,24 @@
+[package]
+name = "otel-desktop-native"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+gpui-kit = "=0.9.0"
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["raw_value", "arbitrary_precision"] }
+anyhow = "1"
+chrono = "0.4"
+chrono-tz = "=0.10.4"
+directories = "6"
+smol = "2"
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls"] }
+
+[dev-dependencies]
+gpui-kit = { version = "=0.9.0", features = ["test-support"] }
+
+[[test]]
+name = "native_ui"
+path = "tests/native_ui.rs"
+harness = false
+test = false

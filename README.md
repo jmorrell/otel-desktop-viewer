@@ -29,6 +29,7 @@ Choose from eight Madoromi seasonal Day/Night themes and 32 named inks.
 - [Example With `otel-cli`](#example-with-otel-cli)
 - [Agent Usage Skill](#agent-usage-skill)
 - [Chart Palettes](docs/chart-palettes.md)
+- [Native macOS GPUI target](native/README.md)
 - [Implementation](#implementation)
 - [What's With the Axolotl??](#whats-with-the-axolotl)
 - [Contributing](#contributing)
@@ -500,6 +501,8 @@ The CLI is a custom OpenTelemetry Collector distribution. Its `desktop` exporter
 - serves a **Svelte** web UI embedded in the binary via [`go:embed`](https://go.dev/embed/)
 
 DuckDB runs in memory by default. Use `--db` for file-backed storage.
+
+The separate macOS GPUI desktop target and its build instructions are documented in [native/README.md](native/README.md). It bundles the Collector backend and keeps the existing CLI and web targets available.
 
 See [ARCHITECTURE.md](docs/ARCHITECTURE.md) for a full system overview.
 

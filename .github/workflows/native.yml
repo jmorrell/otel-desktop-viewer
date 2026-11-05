@@ -1,0 +1,70 @@
+name: Native macOS
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - "native/**"
+      - "desktopexporter/duckdbextension/**"
+      - "desktopexporter/internal/server/**"
+      - "desktopexporter/internal/store/**"
+      - "internal/discovery/**"
+      - "collector_config.go"
+      - "root_command.go"
+      - "go.mod"
+      - "go.sum"
+      - ".github/workflows/native.yml"
+
+jobs:
+  bundle-and-smoke:
+    runs-on: macos-15
+    timeout-minutes: 60
+    env:
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_PROFILE_TEST_DEBUG: "0"
+      CARGO_INCREMENTAL: "0"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.26.5"
+          cache: true
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: "native -> native/target"
+      - name: Build app bundle
+        run: ./native/scripts/package-macos.sh
+      - name: Check Rust formatting and compile all test targets
+        run: |
+          cargo fmt --manifest-path native/Cargo.toml -- --check
+          cargo check --locked --manifest-path native/Cargo.toml --tests
+      - name: Run native backend integration tests
+        run: cargo test --locked --manifest-path native/Cargo.toml --test backend_integration
+      - name: Run native unit tests
+        run: cargo test --locked --manifest-path native/Cargo.toml --bin otel-desktop-native
+      - name: Exercise stdio backend and OTLP gRPC
+        run: python3 native/scripts/smoke-stdio.py "dist/native/otel-desktop-backend"
+      - name: Render production UI against the real backend
+        run: OTEL_NATIVE_ARTIFACTS="$PWD/dist/native/evidence" cargo test --locked --manifest-path native/Cargo.toml --test native_ui
+      - name: Encode offscreen Metal frame capture
+        run: |
+          frame_dir="$(find dist/native/evidence -type d -name frames | sort | tail -n 1)"
+          test -n "$frame_dir"
+          swift native/scripts/encode-evidence.swift "$frame_dir" "${frame_dir%/frames}/native-ui.mp4" 10
+          # Keep reviewable screenshots, manifests, and the encoded recording;
+          # omit hundreds of intermediate PNG frames and the test DuckDB file.
+          find dist/native/evidence -type d -name frames -prune -exec rm -rf {} +
+          find dist/native/evidence -type f -name ui.duckdb -delete
+      - name: Preserve app bundle permissions in a zip artifact
+        run: ditto -c -k --sequesterRsrc --keepParent "dist/native/OTel Desktop Viewer.app" dist/native/otel-desktop-viewer-macos.zip
+      - uses: actions/upload-artifact@v4
+        with:
+          name: otel-desktop-viewer-macos
+          path: dist/native/otel-desktop-viewer-macos.zip
+          if-no-files-found: error
+      - uses: actions/upload-artifact@v4
+        with:
+          name: otel-desktop-native-metal-evidence
+          path: dist/native/evidence/
+          if-no-files-found: error
