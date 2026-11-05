@@ -4,6 +4,9 @@ import (
 	"context"
 	"database/sql"
 	"database/sql/driver"
+	"encoding/json"
+	"go.uber.org/zap"
+	"golang.org/x/exp/jsonrpc2"
 	"io"
 	"net/http"
 	"strconv"
@@ -56,6 +59,24 @@ func TestExportPreviewBoundsAndMetricSelection(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, http.StatusOK, response.StatusCode)
 	assert.Contains(t, string(full), `"asInt":"9223372036854775807"`)
+	t.Run("stdio export preserves HTTP bytes", func(t *testing.T) {
+		native := &Server{store: s, logger: zap.NewNop()}
+		raw, err := json.Marshal(map[string]any{"signal": "metrics", "reference": metricID})
+		require.NoError(t, err)
+		result, err := native.nativeExport(context.Background(), raw)
+		require.NoError(t, err)
+		require.Equal(t, string(full), result.(map[string]string)["content"])
+	})
+
+	t.Run("stdio export distinguishes missing record from malformed selection", func(t *testing.T) {
+		native := &Server{store: s, logger: zap.NewNop()}
+		raw := json.RawMessage(`{"signal":"metrics","reference":"00000000-0000-0000-0000-000000000000"}`)
+		_, err := native.nativeExport(context.Background(), raw)
+		require.ErrorIs(t, err, ErrMetricNotFound)
+		raw = json.RawMessage(`{"signal":"metrics","reference":"not-an-id"}`)
+		_, err = native.nativeExport(context.Background(), raw)
+		require.ErrorIs(t, err, jsonrpc2.ErrInvalidParams)
+	})
 
 	t.Run("head gives the exact full export size", func(t *testing.T) {
 		response, err := http.Head(url)

@@ -9,7 +9,8 @@ import (
 // Config holds settings for the shared DuckDB store and viewer.
 type Config struct {
 	// Endpoint defines the host and port where we serve our frontend app.
-	Endpoint string `mapstructure:"endpoint"`
+	Endpoint  string `mapstructure:"endpoint"`
+	Transport string `mapstructure:"transport"`
 
 	// OTLPHTTPPort advertises the co-located receiver to browser file imports.
 	// Zero leaves import unavailable when this extension is used without that receiver.
@@ -55,6 +56,9 @@ func (cfg *Config) SelfTelemetry() bool {
 
 // Validate checks if the extension configuration is valid.
 func (cfg *Config) Validate() error {
+	if cfg.Transport != "" && cfg.Transport != "http" && cfg.Transport != "stdio" {
+		return fmt.Errorf("invalid transport %q", cfg.Transport)
+	}
 	if cfg.OTLPHTTPPort < 0 || cfg.OTLPHTTPPort > 65535 {
 		return fmt.Errorf("invalid otlp_http_port %d", cfg.OTLPHTTPPort)
 	}
