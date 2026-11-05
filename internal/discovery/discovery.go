@@ -136,15 +136,26 @@ func foundOn(location Location) string {
 }
 
 func Keys(query Query, location Location, records string) string {
-	return `WITH records AS (` + records + `)
-SELECT json_object('key', a.key, 'kind', json_extract_string(a.value, '$.kind'),
-    'foundOn', ` + foundOn(location) + `) AS entry
-FROM records s
-CROSS JOIN unnest(s.attribute_ids) owned(attribute_id)
-JOIN attributes a ON a.id = owned.attribute_id
-WHERE ` + Predicate(query) + `
-GROUP BY a.key, json_extract_string(a.value, '$.kind')
-ORDER BY a.key, json_extract_string(a.value, '$.kind')`
+	predicate := Predicate(query)
+	return `WITH records AS (` + records + `), owned AS (
+    SELECT s.record_id, a.key, a.value
+    FROM records s
+    CROSS JOIN unnest(s.attribute_ids) owned(attribute_id)
+    JOIN attributes a ON a.id = owned.attribute_id
+    WHERE ` + predicate + `
+), key_counts AS (
+    SELECT key, json_extract_string(value, '$.kind') AS kind,
+        count(DISTINCT record_id) AS count
+    FROM owned GROUP BY key, json_extract_string(value, '$.kind')
+), denominator AS (
+    SELECT count(DISTINCT record_id) AS count FROM records s WHERE ` + predicate + `
+)
+SELECT json_object('key', k.key, 'kind', k.kind,
+    'foundOn', ` + foundOn(location) + `,
+    'count', k.count, 'denominator', d.count,
+    'relativeFrequency', k.count::DOUBLE / nullif(d.count, 0)::DOUBLE) AS entry
+FROM key_counts k CROSS JOIN denominator d
+ORDER BY k.key, k.kind`
 }
 
 func Values(query Query, location Location, records, key string) string {

@@ -56,10 +56,10 @@ func (h *JSONRPCHandler) discoverTelemetry(ctx context.Context, req *jsonrpc2.Re
 	if err := decoder.Decode(&options); err != nil {
 		return nil, fmt.Errorf("invalid discovery options: %v: %w", err, jsonrpc2.ErrInvalidParams)
 	}
-	if (options.SortBy != "" && options.SortBy != "name" && options.SortBy != "frequency") ||
+	if (options.SortBy != "" && options.SortBy != "name" && options.SortBy != "frequency" && options.SortBy != "count") ||
 		(options.SortDirection != "" && options.SortDirection != "asc" && options.SortDirection != "desc") ||
 		(options.Kind != "values" && options.Kind != "keys" && (options.SortBy != "" || options.SortDirection != "")) ||
-		(options.Kind == "keys" && options.SortBy != "" && options.SortBy != "name") {
+		(options.Kind == "values" && options.SortBy == "count") {
 		return nil, fmt.Errorf("invalid discovery sort for kind %q: sortBy=%q sortDirection=%q: %w", options.Kind, options.SortBy, options.SortDirection, jsonrpc2.ErrInvalidParams)
 	}
 	for _, bound := range []*string{options.StartTime, options.EndTime} {
@@ -119,7 +119,17 @@ func (h *JSONRPCHandler) discoverTelemetry(ctx context.Context, req *jsonrpc2.Re
 			statement = discovery.Keys(query, location, records)
 			search = "json_extract_string(entry, '$.key')"
 			order = "json_extract_string(entry, '$.key'), json_extract_string(entry, '$.kind')"
-			if options.SortDirection == "desc" {
+			if options.SortBy == "count" || options.SortBy == "frequency" {
+				field := "json_extract(entry, '$.count')::UBIGINT"
+				if options.SortBy == "frequency" {
+					field = "json_extract(entry, '$.relativeFrequency')::DOUBLE"
+				}
+				direction := "DESC"
+				if options.SortDirection == "asc" {
+					direction = "ASC"
+				}
+				order = field + " " + direction + ", json_extract_string(entry, '$.key'), json_extract_string(entry, '$.kind')"
+			} else if options.SortDirection == "desc" {
 				order = "json_extract_string(entry, '$.key') DESC, json_extract_string(entry, '$.kind') DESC"
 			}
 		} else {
