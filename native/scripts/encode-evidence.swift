@@ -106,8 +106,8 @@ do {
             space: CGColorSpaceCreateDeviceRGB(),
             bitmapInfo: CGBitmapInfo.byteOrder32Little.rawValue | CGImageAlphaInfo.premultipliedFirst.rawValue
         ) else { fail("cannot create frame drawing context") }
-        context.translateBy(x: 0, y: CGFloat(height))
-        context.scaleBy(x: 1, y: -1)
+        // CGImage drawing already writes the PNG's rows in the order expected
+        // by the video buffer. Applying a UIKit-style Y flip inverts the video.
         context.draw(cgImage, in: CGRect(x: 0, y: 0, width: width, height: height))
         let presentationTime = CMTime(value: CMTimeValue(index), timescale: CMTimeScale(fps))
         guard adaptor.append(buffer, withPresentationTime: presentationTime) else {
