@@ -12,6 +12,7 @@ import (
 var collectorRedaction string
 
 type configOptions struct {
+	transport        string
 	host             string
 	httpPort         int
 	grpcPort         int
@@ -64,6 +65,10 @@ func collectorURIs(o configOptions) []string {
 		`yaml:service::pipelines::logs::receivers: [otlp]`,
 		`yaml:service::pipelines::logs::processors: [redaction, batch]`,
 		`yaml:service::pipelines::logs::exporters: [desktop]`,
+	}
+	if o.transport == "stdio" {
+		URIs = append(URIs, `yaml:extensions::duckdb::transport: "stdio"`)
+		URIs = append(URIs, `yaml:service::telemetry::logs::output_paths: [stderr]`)
 	}
 	URIs = append(URIs, "yaml:"+collectorRedaction)
 	return append(URIs, telemetryURIs(o)...)

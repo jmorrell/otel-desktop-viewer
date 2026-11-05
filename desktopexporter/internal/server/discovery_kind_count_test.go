@@ -159,3 +159,71 @@ func TestDiscoveryKindCountsDistinctRecordsWithinOwnerAndSignal(t *testing.T) {
 		})
 	}
 }
+
+func TestDiscoveryKeyCoverageSortsGloballyBeforePaging(t *testing.T) {
+	h := setupHandler(t)
+	ctx := context.Background()
+	data := ptrace.NewTraces()
+	for index := range 5 {
+		r := data.ResourceSpans().AppendEmpty()
+		r.Resource().Attributes().PutStr("service.name", "checkout")
+		s := r.ScopeSpans().AppendEmpty().Spans().AppendEmpty()
+		s.SetTraceID(pcommon.TraceID{15: 1})
+		s.SetSpanID(pcommon.SpanID{7: byte(index + 1)})
+		s.SetStartTimestamp(100)
+		s.SetEndTimestamp(101)
+		s.SetName("needle")
+		if index < 4 {
+			s.Attributes().PutStr("frequent", "yes")
+		}
+		if index < 2 {
+			s.Attributes().PutBool("middle", true)
+		}
+		if index == 0 {
+			s.Attributes().PutInt("rare", 1)
+		}
+	}
+	require.NoError(t, h.store.WithConn(func(conn driver.Conn) error {
+		return spans.Ingest(ctx, conn, data, h.store.FlushedIDs())
+	}))
+	query := map[string]any{"type": "condition", "query": map[string]any{
+		"field":         map[string]any{"name": "name", "searchScope": "field", "type": "string"},
+		"fieldOperator": "=", "value": "needle",
+	}}
+	read := func(sortBy, direction string, offset int) (string, int, int, float64, bool) {
+		t.Helper()
+		result, err := h.Handle(ctx, createRequest("discoverTelemetry", map[string]any{"options": map[string]any{
+			"kind": "keys", "signal": "traces", "ownerType": "span", "serviceName": "checkout",
+			"startTime": "100", "endTime": "100", "queries": map[string]any{"traces": query},
+			"sortBy": sortBy, "sortDirection": direction, "limit": 1, "offset": offset,
+		}}))
+		require.NoError(t, err)
+		var page struct {
+			Rows [][]struct {
+				Key               string  `json:"key"`
+				Count             int     `json:"count"`
+				Denominator       int     `json:"denominator"`
+				RelativeFrequency float64 `json:"relativeFrequency"`
+			} `json:"rows"`
+			Truncated bool `json:"truncated"`
+		}
+		require.NoError(t, json.Unmarshal(result.(json.RawMessage), &page))
+		require.Len(t, page.Rows, 1)
+		row := page.Rows[0][0]
+		return row.Key, row.Count, row.Denominator, row.RelativeFrequency, page.Truncated
+	}
+	key, count, denominator, frequency, truncated := read("count", "desc", 0)
+	require.Equal(t, "frequent", key)
+	require.Equal(t, 4, count)
+	require.Equal(t, 5, denominator)
+	require.Equal(t, 0.8, frequency)
+	require.True(t, truncated)
+	key, count, denominator, frequency, truncated = read("frequency", "asc", 0)
+	require.Equal(t, "rare", key)
+	require.Equal(t, 1, count)
+	require.Equal(t, 5, denominator)
+	require.Equal(t, 0.2, frequency)
+	require.True(t, truncated)
+	key, _, _, _, _ = read("name", "asc", 2)
+	require.Equal(t, "rare", key)
+}

@@ -8,6 +8,7 @@ import (
 	"strconv"
 	"time"
 
+	"github.com/CtrlSpice/otel-desktop-viewer/desktopexporter/duckdbextension"
 	"github.com/pkg/browser"
 	"github.com/spf13/cobra"
 	"go.opentelemetry.io/collector/otelcol"
@@ -42,7 +43,7 @@ func newRootCommand(
 	runViewer runCollectorFunc,
 	openURL openURLFunc,
 ) *cobra.Command {
-	options := configOptions{host: "localhost", httpPort: 4318, grpcPort: 4317, browserPort: 8000}
+	options := configOptions{transport: "http", host: "localhost", httpPort: 4318, grpcPort: 4317, browserPort: 8000}
 	openBrowser := true
 
 	root := &cobra.Command{
@@ -53,6 +54,17 @@ func newRootCommand(
 		SilenceErrors: true,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			cmd.SilenceUsage = true
+			if options.transport != "http" && options.transport != "stdio" {
+				return fmt.Errorf("invalid transport %q", options.transport)
+			}
+			if options.transport == "stdio" {
+				ctx, cancel := context.WithCancel(cmd.Context())
+				defer cancel()
+				duckdbextension.SetStdioCancel(cancel)
+				defer duckdbextension.SetStdioCancel(nil)
+				openBrowser = false
+				cmd.SetContext(ctx)
+			}
 			settings := prepareCollectorSettings(set, options)
 			if openBrowser {
 				go openViewerAfterDelay(cmd.Context(), options.host, options.browserPort, openURL)
@@ -68,6 +80,7 @@ func newRootCommand(
 	})
 	root.PersistentFlags().BoolP("help", "h", false, "Help for this command")
 	root.Flags().SortFlags = false
+	root.Flags().StringVar(&options.transport, "transport", "http", "Viewer transport: http or stdio")
 	root.Flags().StringVar(&options.host, "host", options.host, "Address used by viewer/OTLP receivers")
 	root.Flags().IntVar(&options.httpPort, "http", options.httpPort, "OTLP HTTP port")
 	root.Flags().IntVar(&options.grpcPort, "grpc", options.grpcPort, "OTLP gRPC port")

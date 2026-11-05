@@ -12,6 +12,8 @@ package duckdbextension
 
 import (
 	"context"
+	"os"
+	"sync"
 	"time"
 
 	"go.opentelemetry.io/collector/component"
@@ -47,6 +49,10 @@ type DuckDBExtension struct {
 	server *server.Server
 	flags  *features.Flags
 
+	nativeReady     chan struct{}
+	nativeReadyOnce sync.Once
+	nativeCancel    context.CancelFunc
+	nativeDone      chan struct{}
 	retentionCancel context.CancelFunc
 	retentionDone   chan struct{}
 }
@@ -110,14 +116,34 @@ func (e *DuckDBExtension) Start(ctx context.Context, _ component.Host) error {
 	// The cap lives on the store so getStats can report it alongside usage.
 	str.SetRetentionCap(maxBytes)
 
-	if err := srv.Start(); err != nil {
-		str.Close()
-		return err
-	}
+	if e.cfg.Transport != "stdio" {
+		if err := srv.Start(); err != nil {
+			str.Close()
+			return err
+		}
 
+	}
 	e.store = str
 	e.server = srv
 	e.flags = flags
+	if e.cfg.Transport == "stdio" {
+		e.nativeReady = make(chan struct{})
+		e.nativeDone = make(chan struct{})
+		nativeCtx, nativeCancel := context.WithCancel(context.Background())
+		e.nativeCancel = nativeCancel
+		go func() {
+			defer close(e.nativeDone)
+			if err := srv.ServeStdio(nativeCtx, os.Stdin, os.Stdout, e.nativeReady, e.cfg.OTLPGRPCPort, e.cfg.OTLPHTTPPort); err != nil {
+				e.logger.Warn("stdio transport stopped", zap.Error(err))
+			}
+			stdioCancelMu.Lock()
+			cancel := stdioCancel
+			stdioCancelMu.Unlock()
+			if cancel != nil {
+				cancel()
+			}
+		}()
+	}
 	started = true
 	if flags.EvalsEnabled(ctx) {
 		e.logger.Warn("Evals: " + features.ExperimentalLabel)
@@ -141,6 +167,13 @@ func (e *DuckDBExtension) Shutdown(ctx context.Context) error {
 		e.retentionCancel()
 		<-e.retentionDone
 		e.retentionCancel = nil
+	}
+
+	// Interrupt the stdio reader and wait for all RPCs before closing the store.
+	if e.nativeDone != nil {
+		e.nativeCancel()
+		<-e.nativeDone
+		e.nativeDone = nil
 	}
 
 	// Shut down the HTTP server and wait for the serve goroutine to exit.
@@ -236,3 +269,22 @@ func (e *DuckDBExtension) storeSizeBytes(ctx context.Context) int64 {
 	}
 	return size
 }
+
+var stdioCancelMu sync.Mutex
+var stdioCancel context.CancelFunc
+
+// SetStdioCancel links stdin EOF to the owning collector's lifetime.
+func SetStdioCancel(cancel context.CancelFunc) {
+	stdioCancelMu.Lock()
+	defer stdioCancelMu.Unlock()
+	stdioCancel = cancel
+}
+
+// Ready is called by the Collector only after receivers have started.
+func (e *DuckDBExtension) Ready() error {
+	if e.nativeReady != nil {
+		e.nativeReadyOnce.Do(func() { close(e.nativeReady) })
+	}
+	return nil
+}
+func (e *DuckDBExtension) NotReady() error { return nil }

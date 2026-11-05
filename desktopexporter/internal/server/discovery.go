@@ -54,17 +54,18 @@ func (h *JSONRPCHandler) discoverTelemetry(ctx context.Context, req *jsonrpc2.Re
 	decoder := json.NewDecoder(bytes.NewReader(params[0]))
 	decoder.DisallowUnknownFields()
 	if err := decoder.Decode(&options); err != nil {
-		return nil, jsonrpc2.ErrInvalidParams
+		return nil, fmt.Errorf("invalid discovery options: %v: %w", err, jsonrpc2.ErrInvalidParams)
 	}
-	if (options.SortBy != "" && options.SortBy != "name" && options.SortBy != "frequency") ||
+	if (options.SortBy != "" && options.SortBy != "name" && options.SortBy != "frequency" && options.SortBy != "count") ||
 		(options.SortDirection != "" && options.SortDirection != "asc" && options.SortDirection != "desc") ||
-		(options.Kind != "values" && (options.SortBy != "" || options.SortDirection != "")) {
-		return nil, jsonrpc2.ErrInvalidParams
+		(options.Kind != "values" && options.Kind != "keys" && (options.SortBy != "" || options.SortDirection != "")) ||
+		(options.Kind == "values" && options.SortBy == "count") {
+		return nil, fmt.Errorf("invalid discovery sort for kind %q: sortBy=%q sortDirection=%q: %w", options.Kind, options.SortBy, options.SortDirection, jsonrpc2.ErrInvalidParams)
 	}
 	for _, bound := range []*string{options.StartTime, options.EndTime} {
 		if bound != nil {
 			if _, err := strconv.ParseUint(*bound, 10, 64); err != nil {
-				return nil, jsonrpc2.ErrInvalidParams
+				return nil, fmt.Errorf("invalid discovery time bound %q: %w", *bound, jsonrpc2.ErrInvalidParams)
 			}
 		}
 	}
@@ -73,7 +74,7 @@ func (h *JSONRPCHandler) discoverTelemetry(ctx context.Context, req *jsonrpc2.Re
 		limit = *options.Limit
 	}
 	if limit < 1 || limit > 500 || options.Offset > 1_000_000_000 {
-		return nil, jsonrpc2.ErrInvalidParams
+		return nil, fmt.Errorf("discovery limit must be 1..500 and offset must be at most 1000000000: %w", jsonrpc2.ErrInvalidParams)
 	}
 	query := discovery.Query{StartTime: options.StartTime, EndTime: options.EndTime, ServiceName: options.ServiceName, Namespace: options.Namespace, ServiceIdentity: options.ServiceIdentity}
 	if options.Kind == "connections" || options.Kind == "connection-spans" {
@@ -118,6 +119,19 @@ func (h *JSONRPCHandler) discoverTelemetry(ctx context.Context, req *jsonrpc2.Re
 			statement = discovery.Keys(query, location, records)
 			search = "json_extract_string(entry, '$.key')"
 			order = "json_extract_string(entry, '$.key'), json_extract_string(entry, '$.kind')"
+			if options.SortBy == "count" || options.SortBy == "frequency" {
+				field := "json_extract(entry, '$.count')::UBIGINT"
+				if options.SortBy == "frequency" {
+					field = "json_extract(entry, '$.relativeFrequency')::DOUBLE"
+				}
+				direction := "DESC"
+				if options.SortDirection == "asc" {
+					direction = "ASC"
+				}
+				order = field + " " + direction + ", json_extract_string(entry, '$.key'), json_extract_string(entry, '$.kind')"
+			} else if options.SortDirection == "desc" {
+				order = "json_extract_string(entry, '$.key') DESC, json_extract_string(entry, '$.kind') DESC"
+			}
 		} else {
 			if options.Key == nil {
 				return nil, jsonrpc2.ErrInvalidParams

@@ -1,0 +1,232 @@
+{
+  "SPAN": [
+    {
+      "name": "traceID",
+      "type": "string",
+      "searchScope": "field"
+    },
+    {
+      "name": "traceState",
+      "type": "string",
+      "searchScope": "field"
+    },
+    {
+      "name": "spanID",
+      "type": "string",
+      "searchScope": "field"
+    },
+    {
+      "name": "parentSpanID",
+      "type": "string",
+      "searchScope": "field"
+    },
+    {
+      "name": "name",
+      "type": "string",
+      "searchScope": "field"
+    },
+    {
+      "name": "kind",
+      "type": "string",
+      "searchScope": "field"
+    },
+    {
+      "name": "kindCode",
+      "type": "int64",
+      "searchScope": "field"
+    },
+    {
+      "name": "startTime",
+      "type": "int64",
+      "searchScope": "field"
+    },
+    {
+      "name": "endTime",
+      "type": "int64",
+      "searchScope": "field"
+    },
+    {
+      "name": "duration",
+      "type": "int64",
+      "searchScope": "field"
+    },
+    {
+      "name": "droppedAttributesCount",
+      "type": "int64",
+      "searchScope": "field"
+    },
+    {
+      "name": "droppedEventsCount",
+      "type": "int64",
+      "searchScope": "field"
+    },
+    {
+      "name": "droppedLinksCount",
+      "type": "int64",
+      "searchScope": "field"
+    },
+    {
+      "name": "statusCode",
+      "type": "string",
+      "searchScope": "field"
+    },
+    {
+      "name": "statusCodeValue",
+      "type": "int64",
+      "searchScope": "field"
+    },
+    {
+      "name": "statusMessage",
+      "type": "string",
+      "searchScope": "field"
+    },
+    {
+      "name": "event.name",
+      "type": "string",
+      "searchScope": "field"
+    },
+    {
+      "name": "event.timestamp",
+      "type": "int64",
+      "searchScope": "field"
+    },
+    {
+      "name": "event.droppedAttributesCount",
+      "type": "int64",
+      "searchScope": "field"
+    },
+    {
+      "name": "flags",
+      "type": "int64",
+      "searchScope": "field"
+    },
+    {
+      "name": "link.flags",
+      "type": "int64",
+      "searchScope": "field"
+    },
+    {
+      "name": "link.traceID",
+      "type": "string",
+      "searchScope": "field"
+    },
+    {
+      "name": "link.spanID",
+      "type": "string",
+      "searchScope": "field"
+    },
+    {
+      "name": "link.traceState",
+      "type": "string",
+      "searchScope": "field"
+    },
+    {
+      "name": "link.droppedAttributesCount",
+      "type": "int64",
+      "searchScope": "field"
+    }
+  ],
+  "LOG": [
+    {
+      "name": "timestamp",
+      "type": "int64",
+      "searchScope": "field"
+    },
+    {
+      "name": "observedTimestamp",
+      "type": "int64",
+      "searchScope": "field"
+    },
+    {
+      "name": "traceID",
+      "type": "string",
+      "searchScope": "field"
+    },
+    {
+      "name": "spanID",
+      "type": "string",
+      "searchScope": "field"
+    },
+    {
+      "name": "severityText",
+      "type": "string",
+      "searchScope": "field"
+    },
+    {
+      "name": "severityNumber",
+      "type": "int64",
+      "searchScope": "field"
+    },
+    {
+      "name": "body",
+      "type": "string",
+      "searchScope": "field"
+    },
+    {
+      "name": "droppedAttributesCount",
+      "type": "int64",
+      "searchScope": "field"
+    },
+    {
+      "name": "flags",
+      "type": "int64",
+      "searchScope": "field"
+    },
+    {
+      "name": "eventName",
+      "type": "string",
+      "searchScope": "field"
+    }
+  ],
+  "METRIC": [
+    {
+      "name": "name",
+      "type": "string",
+      "searchScope": "field"
+    },
+    {
+      "name": "description",
+      "type": "string",
+      "searchScope": "field"
+    },
+    {
+      "name": "unit",
+      "type": "string",
+      "searchScope": "field"
+    },
+    {
+      "name": "type",
+      "type": "string",
+      "searchScope": "field"
+    }
+  ],
+  "SCOPE": [
+    {
+      "name": "scope.name",
+      "type": "string",
+      "searchScope": "field"
+    },
+    {
+      "name": "scope.version",
+      "type": "string",
+      "searchScope": "field"
+    },
+    {
+      "name": "scope.droppedAttributesCount",
+      "type": "int64",
+      "searchScope": "field"
+    }
+  ],
+  "RESOURCE": [
+    {
+      "name": "serviceIdentity",
+      "type": "string",
+      "searchScope": "field"
+    },
+    {
+      "name": "resource.droppedAttributesCount",
+      "type": "int64",
+      "searchScope": "field"
+    }
+  ]
+}

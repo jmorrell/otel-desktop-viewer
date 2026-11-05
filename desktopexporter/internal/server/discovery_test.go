@@ -279,6 +279,10 @@ func TestDiscoveryRejectsInvalidOptions(t *testing.T) {
 		_, err := h.Handle(context.Background(), createRequest("discoverTelemetry", []any{options}))
 		require.Error(t, err, "%v", options)
 	}
+	_, err := h.Handle(context.Background(), createRequest("discoverTelemetry", []any{map[string]any{"kind": "services", "sortBy": "name"}}))
+	require.ErrorContains(t, err, "invalid discovery sort")
+	_, err = h.Handle(context.Background(), createRequest("discoverTelemetry", []any{map[string]any{"kind": "services", "unexpected": true}}))
+	require.ErrorContains(t, err, "unexpected")
 }
 
 func TestDiscoveryValueSortAcrossPages(t *testing.T) {
@@ -352,5 +356,42 @@ func TestHomeLinksMatchMissingNamespaceAcrossSignals(t *testing.T) {
 				require.Empty(t, rows, method)
 			}
 		}
+	}
+}
+
+func TestDiscoveryKeySortAcrossPages(t *testing.T) {
+	h := setupHandler(t)
+	ctx := context.Background()
+	traces := buildTestTraces()
+	attrs := traces.ResourceSpans().At(0).ScopeSpans().At(0).Spans().At(0).Attributes()
+	attrs.PutStr("a-sort-key", "a")
+	attrs.PutStr("z-sort-key", "z")
+	require.NoError(t, h.store.WithConn(func(conn driver.Conn) error { return spans.Ingest(ctx, conn, traces, h.store.FlushedIDs()) }))
+	var sequences [2][]string
+	for i, direction := range []string{"asc", "desc"} {
+		for offset := 0; offset < 100; offset++ {
+			result, err := h.Handle(ctx, createRequest("discoverTelemetry", map[string]any{"options": map[string]any{"kind": "keys", "signal": "traces", "ownerType": "span", "sortBy": "name", "sortDirection": direction, "limit": 1, "offset": offset}}))
+			require.NoError(t, err)
+			var page struct {
+				Rows [][]struct {
+					Key  string `json:"key"`
+					Kind string `json:"kind"`
+				} `json:"rows"`
+				Truncated bool `json:"truncated"`
+			}
+			require.NoError(t, json.Unmarshal(result.(json.RawMessage), &page))
+			if len(page.Rows) == 0 {
+				break
+			}
+			sequences[i] = append(sequences[i], page.Rows[0][0].Key+"\x00"+page.Rows[0][0].Kind)
+			if !page.Truncated {
+				break
+			}
+		}
+	}
+	require.GreaterOrEqual(t, len(sequences[0]), 2)
+	require.Equal(t, len(sequences[0]), len(sequences[1]))
+	for i := range sequences[0] {
+		require.Equal(t, sequences[0][i], sequences[1][len(sequences[1])-1-i])
 	}
 }
